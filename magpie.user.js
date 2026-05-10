@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Magpie
 // @namespace    com.magpie.stash
-// @version      1.8
+// @version      1.9
 // @description  One-click YouTube audio stash via local server
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -63,7 +63,7 @@
     return el;
   }
 
-  function showStashed(path) {
+  function showStashed(message) {
     const el = ensureStatusEl();
     el.innerHTML = '';
 
@@ -72,45 +72,11 @@
     check.style.cssText = 'color: #4ade80; font-weight: 700; margin-right: 8px;';
 
     const label = document.createElement('span');
-    label.textContent = 'Stashed at';
-    label.style.cssText = 'color: rgba(255,255,255,0.55); margin-right: 8px; font-weight: 500;';
-
-    const pathEl = document.createElement('code');
-    pathEl.textContent = path;
-    pathEl.title = 'Click to copy';
-    pathEl.style.cssText = `
-      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-      color: #fff;
-      font-size: 12.5px;
-      cursor: pointer;
-      padding: 1px 4px;
-      border-radius: 4px;
-      transition: background 120ms ease;
-    `;
-    pathEl.addEventListener('mouseenter', () => {
-      pathEl.style.background = 'rgba(255,255,255,0.08)';
-    });
-    pathEl.addEventListener('mouseleave', () => {
-      pathEl.style.background = 'transparent';
-    });
-    pathEl.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(path);
-        const original = pathEl.textContent;
-        pathEl.textContent = 'copied ✓';
-        pathEl.style.color = '#4ade80';
-        setTimeout(() => {
-          pathEl.textContent = original;
-          pathEl.style.color = '#fff';
-        }, 1200);
-      } catch (e) {
-        LOG('clipboard copy failed:', e);
-      }
-    });
+    label.textContent = message || 'Added to Music library';
+    label.style.cssText = 'color: rgba(255,255,255,0.85); font-weight: 500;';
 
     el.appendChild(check);
     el.appendChild(label);
-    el.appendChild(pathEl);
     el.style.display = 'block';
   }
 
@@ -242,7 +208,7 @@
             if (msg.ok) {
               LOG('saved:', msg.path);
               flash(btn, '✅ Stashed', '#2a6a2a');
-              if (msg.path) showStashed(msg.path);
+              showStashed(msg.message);
             } else {
               LOG('server error:', msg.error);
               flash(btn, '⚠️ Failed', '#7a2a2a', 4000);
@@ -263,7 +229,7 @@
               if (msg.ok) {
                 LOG('saved:', msg.path);
                 flash(btn, '✅ Stashed', '#2a6a2a');
-                if (msg.path) showStashed(msg.path);
+                showStashed(msg.message);
               } else {
                 LOG('server error:', msg.error);
                 flash(btn, '⚠️ Failed', '#7a2a2a', 4000);
@@ -323,7 +289,7 @@
       align-self: center;
       justify-content: center;
       gap: 6px;
-      visibility: visible !important;
+      visibility: hidden;
       opacity: 1 !important;
       position: relative;
       flex-shrink: 0;
@@ -374,18 +340,13 @@
   //
   // The action bar containers (#top-level-buttons-computed, ytd-menu-renderer,
   // #actions) all hard-clip their contents via overflow + fixed sizing.
-  // Inserting inside them — even with CSS overrides — produces an invisible
-  // button. So we stay OUTSIDE those containers entirely.
+  // If a strategy produces a clipped button, the visibility check removes it
+  // and the retry loop (setInterval + MutationObserver) will try again.
   //
-  // Strategy A: insert as a sibling of #actions, inside the flex row that
-  //   holds both #owner and #actions. The button appears in the same row,
-  //   right before the Like/Share buttons. The parent row is a visible flex
-  //   container (it renders Subscribe AND the action buttons) so adding one
-  //   more flex item is safe.
-  //
-  // Strategy B: insert after #subscribe-button inside #owner.
-  //
-  // Strategy C: if ytd-watch-metadata exists but nothing else, append there.
+  // Strategy A: inside ytd-menu-renderer, before the overflow "..." button.
+  // Strategy B: sibling of #actions in its parent flex row.
+  // Strategy C: after #subscribe-button inside #owner.
+  // Strategy D: append to #owner.
 
   function tryStrategies() {
     const strategies = [
@@ -412,7 +373,7 @@
         if (row === document.body || row === document.documentElement) return null;
         return { insert: (btn) => actions.insertAdjacentElement('afterend', btn), label: 'after #actions in row' };
       },
-      // B — after subscribe button
+      // C — after subscribe button
       function () {
         const sub =
           document.querySelector('#owner #subscribe-button') ||
@@ -420,33 +381,13 @@
         if (!sub) return null;
         return { insert: (btn) => sub.insertAdjacentElement('afterend', btn), label: 'after #subscribe-button' };
       },
-      // C — append to #owner
+      // D — append to #owner
       function () {
         const owner =
           document.querySelector('ytd-watch-metadata #owner') ||
           document.querySelector('#owner');
         if (!owner) return null;
         return { insert: (btn) => owner.appendChild(btn), label: 'appended to #owner' };
-      },
-      // D — append to ytd-watch-metadata
-      function () {
-        const meta = document.querySelector('ytd-watch-metadata');
-        if (!meta) return null;
-        return {
-          insert: (btn) => {
-            const anchor = meta.querySelector('#actions') || meta.querySelector('#owner');
-            if (anchor) {
-              let row = anchor;
-              while (row.parentNode !== meta && row.parentNode) row = row.parentNode;
-              if (row.parentNode === meta) {
-                row.insertAdjacentElement('afterend', btn);
-                return;
-              }
-            }
-            meta.appendChild(btn);
-          },
-          label: 'in ytd-watch-metadata'
-        };
       },
     ];
 
@@ -486,48 +427,19 @@
     lastInjectedUrl = location.href;
     LOG('button injected:', strategy.label);
 
-    // Verify visibility — if this strategy got clipped, try the next one
-    setTimeout(() => {
+    // Verify visibility after layout settles — if clipped, remove and let retry loop handle it
+    requestAnimationFrame(() => { requestAnimationFrame(() => {
       if (!btn.isConnected) return;
       const r = btn.getBoundingClientRect();
       if (r.width > 0 && r.height > 0) {
+        btn.style.visibility = 'visible';
         LOG('button visible at', Math.round(r.x) + ',' + Math.round(r.y),
             Math.round(r.width) + 'x' + Math.round(r.height));
         return;
       }
-      LOG('button NOT visible via', strategy.label, '— trying next strategy');
-      // Log what's clipping it
-      let el = btn.parentNode;
-      while (el && el !== document.body) {
-        const cs = getComputedStyle(el);
-        LOG('  ', el.tagName + (el.id ? '#' + el.id : ''),
-            'overflow=' + cs.overflow, 'display=' + cs.display,
-            'w=' + el.offsetWidth, 'h=' + el.offsetHeight);
-        el = el.parentNode;
-      }
+      LOG('button clipped via', strategy.label, '— removing, will retry');
       btn.remove();
-      // Brute-force: try remaining strategies
-      const allStrats = [
-        tryStrategies, // will skip A if #actions not found, etc.
-      ];
-      // Just go straight to the ytd-watch-metadata fallback
-      const meta = document.querySelector('ytd-watch-metadata');
-      if (meta) {
-        const fallback = buildButton();
-        const anchor = meta.querySelector('#actions') || meta.querySelector('#owner');
-        if (anchor) {
-          let row = anchor;
-          while (row.parentNode !== meta && row.parentNode) row = row.parentNode;
-          if (row.parentNode === meta) {
-            row.insertAdjacentElement('afterend', fallback);
-            LOG('fallback: inserted after row in ytd-watch-metadata');
-            return;
-          }
-        }
-        meta.appendChild(fallback);
-        LOG('fallback: appended to ytd-watch-metadata');
-      }
-    }, 200);
+    }); });
   }
 
   inject();

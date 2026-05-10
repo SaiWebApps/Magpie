@@ -32,7 +32,7 @@ from threading import Thread
 VERSION = "2.0-http"
 
 HOME = Path.home()
-DEST_DIR = HOME / "Music" / "Music" / "Media.localized" / "Music"
+DEST_DIR = HOME / "Music" / "Music" / "Media.localized" / "Automatically Add to Music.localized"
 
 YT_DLP_CANDIDATES = [
     "/opt/homebrew/bin/yt-dlp",
@@ -352,7 +352,16 @@ class MagpieHandler(BaseHTTPRequestHandler):
             return
 
         # Prepare output path
-        DEST_DIR.mkdir(parents=True, exist_ok=True)
+        if not DEST_DIR.exists():
+            send_progress({
+                "type": "done",
+                "ok": False,
+                "error": (
+                    f"Destination folder not found: {DEST_DIR}\n"
+                    "Open the Music app at least once to create this folder."
+                ),
+            })
+            return
         output_template = str(DEST_DIR / f"{name}.%(ext)s")
         expected_path = str(DEST_DIR / f"{name}.mp3")
 
@@ -422,8 +431,8 @@ class MagpieHandler(BaseHTTPRequestHandler):
         proc.wait()
         dlog(f"yt-dlp exited with code {proc.returncode}")
 
-        if proc.returncode == 0 and os.path.exists(expected_path):
-            send_progress({"type": "done", "ok": True, "path": expected_path})
+        if proc.returncode == 0:
+            send_progress({"type": "done", "ok": True, "path": expected_path, "message": "Added to Music library"})
         else:
             err_text = "\n".join(tail[-12:]) if tail else f"exit code {proc.returncode}"
             err_text += f"\n\n[ran: {' '.join(cmd)}]"
