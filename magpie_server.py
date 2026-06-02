@@ -25,14 +25,15 @@ import tempfile
 import traceback
 import urllib.request
 import zipfile
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 
 VERSION = "2.0-http"
 
 HOME = Path.home()
 DEST_DIR = HOME / "Music" / "Music" / "Media.localized" / "Automatically Add to Music.localized"
+VIDEO_DEST_DIR = HOME / "Movies"
 
 YT_DLP_CANDIDATES = [
     "/opt/homebrew/bin/yt-dlp",
@@ -60,6 +61,7 @@ EVERMEET_FFPROBE = "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip"
 ALLOWED_ORIGINS = {"https://www.youtube.com", "https://youtube.com"}
 
 PROGRESS_RE = re.compile(r"^\[download\]\s+(\d+(?:\.\d+)?)%")
+PLAYLIST_ITEM_RE = re.compile(r"^\[download\]\s+Downloading item (\d+) of (\d+)")
 
 AUTH_TOKEN = secrets.token_urlsafe(32)
 
@@ -195,6 +197,10 @@ class MagpieHandler(BaseHTTPRequestHandler):
     """Handles /health, /token, and /stash endpoints."""
 
     server_version = f"Magpie/{VERSION}"
+    # HTTP/1.1 so /stash can stream with chunked transfer encoding (the browser
+    # hands each chunk to GM_xmlhttpRequest's onprogress as it arrives). All
+    # non-stream responses send Content-Length, so keep-alive stays well-framed.
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):
         dlog(f"HTTP {format % args}")
@@ -286,26 +292,52 @@ class MagpieHandler(BaseHTTPRequestHandler):
 
         url = body.get("url")
         name = sanitize(body.get("name", "audio"))
+        format = body.get("format", "mp3")
+        if format not in ("mp3", "mp4"):
+            self._send_json(400, {"error": "format must be mp3 or mp4"})
+            return
+        is_audio = format == "mp3"
+        playlist = body.get("playlist", False)
 
         if not url:
             self._send_json(400, {"error": "missing url"})
             return
 
-        dlog(f"stash request: url={url} name={name}")
+        dlog(f"stash request: url={url} name={name} format={format} playlist={playlist}")
 
-        # Begin SSE response
+        # Begin the streaming response. Chunked transfer encoding lets the
+        # browser hand each NDJSON line to GM_xmlhttpRequest's onprogress as it
+        # arrives instead of buffering the whole body until the socket closes,
+        # and the terminating 0-length chunk gives an explicit end-of-stream.
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
         self._set_cors_headers()
         self.end_headers()
 
+        stream_ended = [False]
+
         def send_progress(data_dict):
+            if stream_ended[0]:
+                return
             try:
-                self.wfile.write(ndjson_line(data_dict).encode("utf-8"))
+                payload = ndjson_line(data_dict).encode("utf-8")
+                # Chunked framing: <hex length> CRLF <payload> CRLF, written as a
+                # single atomic write so concurrent playlist progress updates
+                # (serialized under a lock) can't interleave within a frame.
+                self.wfile.write(b"%X\r\n%s\r\n" % (len(payload), payload))
+                # Every _handle_stash code path ends by sending exactly one
+                # {"type": "done"} message; emit the terminating 0-length chunk
+                # right after it so the browser fires onload promptly.
+                if data_dict.get("type") == "done":
+                    self.wfile.write(b"0\r\n\r\n")
+                    stream_ended[0] = True
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError) as exc:
+                stream_ended[0] = True
                 dlog(f"client disconnected during stream: {exc}")
 
         # Find yt-dlp
@@ -352,25 +384,32 @@ class MagpieHandler(BaseHTTPRequestHandler):
             return
 
         # Prepare output path
-        if not DEST_DIR.exists():
+        dest_dir = DEST_DIR if is_audio else VIDEO_DEST_DIR
+        if not dest_dir.exists():
+            hint = " Open the Music app at least once to create this folder." if is_audio else ""
             send_progress({
                 "type": "done",
                 "ok": False,
-                "error": (
-                    f"Destination folder not found: {DEST_DIR}\n"
-                    "Open the Music app at least once to create this folder."
-                ),
+                "error": f"Destination folder not found: {dest_dir}.{hint}",
             })
             return
-        output_template = str(DEST_DIR / f"{name}.%(ext)s")
-        expected_path = str(DEST_DIR / f"{name}.mp3")
+        if playlist:
+            self._download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp, send_progress)
+            return
+
+        output_template = str(dest_dir / f"{name}.%(ext)s")
+        expected_path = str(dest_dir / f"{name}.{format}")
 
         # Build yt-dlp command through a login shell (resolves dylib paths)
+        if is_audio:
+            format_args = ["-x", "--audio-format", "mp3"]
+        else:
+            format_args = ["--merge-output-format", "mp4"]
+        playlist_args = [] if playlist else ["--no-playlist"]
         yt_dlp_cmd = " ".join([
             shlex.quote(yt_dlp),
-            "-x",
-            "--audio-format", "mp3",
-            "--no-playlist",
+            *format_args,
+            *playlist_args,
             "--newline",
             "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
             "-o", shlex.quote(output_template),
@@ -411,6 +450,12 @@ class MagpieHandler(BaseHTTPRequestHandler):
                 tail.pop(0)
             dlog(f"yt-dlp> {line}")
 
+            pm = PLAYLIST_ITEM_RE.match(line)
+            if pm:
+                send_progress({"type": "progress", "phase": "playlist_item", "current": int(pm.group(1)), "total": int(pm.group(2))})
+                last_pct_int = -1
+                continue
+
             m = PROGRESS_RE.match(line)
             if m:
                 pct = float(m.group(1))
@@ -432,11 +477,115 @@ class MagpieHandler(BaseHTTPRequestHandler):
         dlog(f"yt-dlp exited with code {proc.returncode}")
 
         if proc.returncode == 0:
-            send_progress({"type": "done", "ok": True, "path": expected_path, "message": "Added to Music library"})
+            if playlist:
+                dest_label = "Music library" if is_audio else "Movies folder"
+                message = f"Stashed playlist to {dest_label}"
+            else:
+                message = "Added to Music library" if is_audio else "Saved to Movies folder"
+            send_progress({"type": "done", "ok": True, "path": expected_path, "message": message})
         else:
             err_text = "\n".join(tail[-12:]) if tail else f"exit code {proc.returncode}"
             err_text += f"\n\n[ran: {' '.join(cmd)}]"
             send_progress({"type": "done", "ok": False, "error": err_text})
+
+    def _download_playlist_parallel(self, url, name, is_audio, dest_dir, ffmpeg, yt_dlp, send_progress):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        send_progress({"type": "progress", "phase": "loading"})
+
+        flat_cmd = ["/bin/zsh", "-l", "-c", " ".join([
+            shlex.quote(yt_dlp),
+            "--flat-playlist", "--dump-json",
+            shlex.quote(url),
+        ])]
+        dlog(f"extracting playlist: {flat_cmd}")
+
+        try:
+            proc = subprocess.run(flat_cmd, capture_output=True, text=True, timeout=120)
+        except Exception as e:
+            send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist: {e}"})
+            return
+
+        if proc.returncode != 0:
+            err = proc.stderr[-500:] if proc.stderr else f"exit code {proc.returncode}"
+            send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist:\n{err}"})
+            return
+
+        items = []
+        for line in proc.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                video_url = entry.get("webpage_url") or entry.get("url", "")
+                if not video_url.startswith("http"):
+                    video_url = f"https://www.youtube.com/watch?v={video_url}"
+                items.append(video_url)
+            except json.JSONDecodeError:
+                continue
+
+        total = len(items)
+        if total == 0:
+            send_progress({"type": "done", "ok": False, "error": "no items found in playlist"})
+            return
+
+        dlog(f"playlist: {total} items, downloading 3 at a time")
+        send_progress({"type": "progress", "phase": "playlist_item", "current": 0, "total": total})
+
+        subfolder = dest_dir / name
+        subfolder.mkdir(parents=True, exist_ok=True)
+        template = str(subfolder / "%(title)s.%(ext)s")
+
+        if is_audio:
+            fmt_args = ["-x", "--audio-format", "mp3"]
+        else:
+            fmt_args = ["--merge-output-format", "mp4"]
+
+        lock = Lock()
+        completed = [0]
+        failed = [0]
+
+        def dl(video_url):
+            yt_cmd = " ".join([
+                shlex.quote(yt_dlp),
+                *fmt_args,
+                "--no-playlist",
+                "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
+                "-o", shlex.quote(template),
+                shlex.quote(video_url),
+            ])
+            cmd = ["/bin/zsh", "-l", "-c", yt_cmd]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                ok = r.returncode == 0
+                if not ok:
+                    dlog(f"playlist item failed: {video_url}: {r.stderr[-200:]}")
+            except Exception as e:
+                dlog(f"playlist item error: {video_url}: {e}")
+                ok = False
+            with lock:
+                if ok:
+                    completed[0] += 1
+                else:
+                    failed[0] += 1
+                done = completed[0] + failed[0]
+                try:
+                    send_progress({"type": "progress", "phase": "playlist_item", "current": done, "total": total})
+                except Exception:
+                    pass
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(dl, v) for v in items]
+            for f in as_completed(futures):
+                pass
+
+        dest_label = "Music library" if is_audio else "Movies folder"
+        if failed[0] == 0:
+            msg = f"Stashed {total} tracks to {dest_label}"
+            send_progress({"type": "done", "ok": True, "path": str(subfolder), "message": msg})
+        else:
+            msg = f"Stashed {completed[0]}/{total} to {dest_label} ({failed[0]} failed)"
+            send_progress({"type": "done", "ok": completed[0] > 0, "path": str(subfolder), "message": msg})
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +614,7 @@ def main():
     print(f"MAGPIE_TOKEN={AUTH_TOKEN}", flush=True)
     dlog(f"auth token: {AUTH_TOKEN}")
 
-    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), MagpieHandler)
+    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), MagpieHandler)
     dlog(f"listening on http://{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"Magpie server {VERSION} listening on http://{LISTEN_HOST}:{LISTEN_PORT}", flush=True)
 
