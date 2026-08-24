@@ -140,14 +140,27 @@ Name a stash `{Album}_{Track}` and Magpie writes real tags into the file before
 it uploads:
 
 ```
-AC_Mirage_Escape.mp3        album = AC        title = Mirage_Escape
-WetLeg_NotFun.mp3           album = WetLeg    title = NotFun
+AC3_AgainstAllOdds.mp3      album = AC        title = AC3_AgainstAllOdds
+AC_Mirage_Escape.mp3        album = AC        title = AC_Mirage_Escape
+WetLeg_NotFun.mp3           album = WetLeg    title = WetLeg_NotFun
 Espresso.mp3                (no album)        title = Espresso
 ```
 
-The split is on the **first** underscore. A name with no underscore gets a
-title only — inventing an album from a single word is worse than leaving it
-unset.
+The leading token up to the **first** underscore becomes the album. The title
+is the **whole filename** — the album is a grouping key, not something to strip
+out. Removing it would turn `AC2_FlightOverVenice`, `AC3_ManInWolfHood` and
+`AC4_Pirates` into titles that no longer say which game they came from, and
+since all three share the album `AC`, that information would be gone for good.
+
+A name with no underscore gets a title only — inventing an album from a single
+word is worse than leaving it unset.
+
+**Track numbers** are rewritten per album, in filename order. A YouTube
+download inherits whatever track number the source carried, which is
+meaningless here — most land on 1, some on 33 — and players order an album by
+that number, so an album stays shuffled however you sort it. After a stash,
+Magpie renumbers only the album it touched, and only the files whose number is
+actually wrong.
 
 This matters because yt-dlp leaves downloads with no tags at all. Untagged
 files show up in iBroadcast as "Unknown Album" with the filename as the title,

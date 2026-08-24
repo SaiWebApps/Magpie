@@ -241,9 +241,24 @@ def tag_downloads(paths, config, ffmpeg, is_audio):
     Runs before the iBroadcast upload so the library gets real album and title
     values instead of falling back to the filename. A tagging failure is never
     fatal — an untagged file is still a good file."""
-    if not is_audio or not config.get("tag_from_filename"):
+    if not is_audio or not config.get("tag_from_filename") or not paths:
         return
-    magpie_tags.tag_all(paths, ffmpeg, config.get("album_aliases"), dlog)
+    aliases = config.get("album_aliases")
+    magpie_tags.tag_all(paths, ffmpeg, aliases, dlog)
+
+    # Renumber only the albums this stash touched. A YouTube download inherits
+    # a meaningless track number from the source, and players order an album by
+    # that number — so without this the album stays shuffled however it is
+    # sorted. Restricting to the touched albums keeps a one-song stash cheap.
+    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
+    if not os.path.exists(ffprobe):
+        dlog(f"no ffprobe beside {ffmpeg}; leaving track numbers alone")
+        return
+    albums = {magpie_tags.parse_name(Path(p).stem, aliases)[0] for p in paths}
+    albums.discard(None)
+    if albums:
+        magpie_tags.renumber_albums(Path(paths[0]).parent, ffmpeg, ffprobe,
+                                    aliases, albums=albums, log=dlog)
 
 
 def run_backup(paths, enabled, is_audio, send_progress):

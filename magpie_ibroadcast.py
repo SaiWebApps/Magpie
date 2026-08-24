@@ -41,6 +41,11 @@ HOME = Path.home()
 TOKEN_PATH = Path(os.environ.get("MAGPIE_IBROADCAST_TOKEN")
                   or HOME / ".config" / "magpie-ibroadcast.json")
 
+# Checksums this machine has uploaded. Needed because iBroadcast's own index
+# lags behind processing — see load_sent().
+SENT_PATH = Path(os.environ.get("MAGPIE_IBROADCAST_SENT")
+                 or HOME / ".config" / "magpie-ibroadcast-sent.json")
+
 # iBroadcast is a music service; video stashes are never sent.
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".wma", ".aiff"}
 
@@ -282,6 +287,40 @@ def library_md5s(token):
     return set(obj.get("md5") or [])
 
 
+def load_sent():
+    """MD5s this machine has already uploaded.
+
+    iBroadcast accepts an upload before it finishes processing it, and its
+    checksum index only lists processed tracks — so a file sent a minute ago
+    can still be absent from library_md5s(). Trusting that index alone once
+    put 25 duplicates in the library. This local record closes that window."""
+    try:
+        with open(SENT_PATH) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    return set(data) if isinstance(data, list) else set()
+
+
+def record_sent(digests):
+    """Add digests to the local record of what has been uploaded."""
+    if not digests:
+        return
+    merged = load_sent() | set(digests)
+    try:
+        SENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(SENT_PATH, "w") as f:
+            json.dump(sorted(merged), f)
+    except OSError:
+        pass
+
+
+def already_uploaded(token):
+    """Everything known to be in the library: the server's index plus what this
+    machine has sent recently but the server may not have indexed yet."""
+    return library_md5s(token) | load_sent()
+
+
 def file_md5(path):
     digest = hashlib.md5()
     with open(path, "rb") as f:
@@ -340,17 +379,22 @@ def backup(paths, log=lambda m: None, progress=lambda done, total: None):
         if token is None:
             return "disabled", "iBroadcast not set up; run: make ibroadcast-login"
 
-        known = library_md5s(token)
+        known = already_uploaded(token)
         total = len(audio)
         uploaded = skipped = 0
         for index, path in enumerate(audio, 1):
             progress(index, total)
-            if file_md5(path) in known:
+            digest = file_md5(path)
+            if digest in known:
                 log(f"ibroadcast: already in library, skipping {path.name}")
                 skipped += 1
                 continue
             log(f"ibroadcast: uploading {path.name}")
             upload_file(path, token)
+            # Record before the server can index it, so a repeat run in the
+            # next few minutes does not send it twice.
+            record_sent([digest])
+            known.add(digest)
             uploaded += 1
 
         if uploaded:
