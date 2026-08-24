@@ -187,6 +187,27 @@ def strip_xattrs(path):
         dlog(f"xattr -c on {path}: {exc}")
 
 
+QUARANTINE_ATTR = "com.apple.quarantine"
+
+
+def strip_quarantine(path):
+    """Clear the Gatekeeper quarantine flag from a finished download.
+
+    macOS attributes a download to the browser that triggered it, and Music.app
+    refuses to open media still carrying the flag. Unlike strip_xattrs() this
+    removes only that one attribute, so Finder tags on files already sitting in
+    the destination folder survive. xattr(1) is used because os.removexattr is
+    absent from macOS Python builds."""
+    try:
+        # Returns non-zero when the attribute is not set; that is not an error.
+        subprocess.run(
+            ["/usr/bin/xattr", "-d", QUARANTINE_ATTR, str(path)],
+            check=False, capture_output=True, timeout=10,
+        )
+    except Exception as exc:
+        dlog(f"could not clear quarantine on {path}: {exc}")
+
+
 def ffmpeg_runs(path):
     """Returns True iff path actually executes successfully (all dylibs resolve
     and Gatekeeper allows it)."""
@@ -554,7 +575,12 @@ class MagpieHandler(BaseHTTPRequestHandler):
 
         if proc.returncode == 0:
             # Playlists return early via _download_playlist_parallel, so this
-            # path is always a single file.
+            # path is always a single file. Match on the stash name instead of
+            # expected_path: yt-dlp lands on a different extension whenever the
+            # audio conversion is skipped, and that file needs clearing too.
+            for produced in dest_dir.iterdir():
+                if produced.is_file() and produced.name.startswith(name + "."):
+                    strip_quarantine(produced)
             message = f"Saved to {display_path(dest_dir)}"
             send_progress({"type": "done", "ok": True, "path": expected_path, "message": message})
         else:
@@ -652,6 +678,10 @@ class MagpieHandler(BaseHTTPRequestHandler):
             futures = [pool.submit(dl, v) for v in items]
             for f in as_completed(futures):
                 pass
+
+        for produced in subfolder.iterdir():
+            if produced.is_file():
+                strip_quarantine(produced)
 
         dest_label = display_path(subfolder)
         if failed[0] == 0:
