@@ -10,6 +10,9 @@ Endpoints:
 Auth: Bearer token generated on startup, printed to stdout and written to
 /tmp/magpie-token.
 
+Save locations live in ~/.config/magpie.json ("audio_dir" / "video_dir"),
+written with defaults on first run and re-read on every stash.
+
 Debug log lives at /tmp/magpie.log — tail it to see what's happening.
 """
 
@@ -32,8 +35,12 @@ from threading import Lock, Thread
 VERSION = "2.0-http"
 
 HOME = Path.home()
-DEST_DIR = HOME / "Music" / "Music" / "Media.localized" / "Automatically Add to Music.localized"
-VIDEO_DEST_DIR = HOME / "Movies"
+
+# Destination folders. These are the fallbacks; load_config() lets a JSON file
+# at CONFIG_PATH override either one without touching this file.
+CONFIG_PATH = Path(os.environ.get("MAGPIE_CONFIG") or HOME / ".config" / "magpie.json")
+DEFAULT_AUDIO_DIR = HOME / "Music"
+DEFAULT_VIDEO_DIR = HOME / "Movies"
 
 YT_DLP_CANDIDATES = [
     "/opt/homebrew/bin/yt-dlp",
@@ -76,6 +83,70 @@ def dlog(msg):
             f.write(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}\n")
     except Exception as exc:
         sys.stderr.write(f"dlog failed: {exc}\n")
+
+
+def display_path(p: Path) -> str:
+    """Render a path with the home folder collapsed to ~ for display."""
+    try:
+        return "~/" + str(p.relative_to(HOME))
+    except ValueError:
+        return str(p)
+
+
+def _coerce_dir(value, default: Path) -> Path:
+    """Turn one config value into an absolute Path, falling back to default.
+
+    A relative path is rejected rather than resolved, because the server's
+    working directory is whatever launchd handed it — not something the user
+    can reason about when editing the config."""
+    if not isinstance(value, str) or not value.strip():
+        return default
+    p = Path(value.strip()).expanduser()
+    if not p.is_absolute():
+        dlog(f"config: {value!r} is not an absolute path; using {default}")
+        return default
+    return p
+
+
+def load_config():
+    """Return (audio_dir, video_dir) from CONFIG_PATH.
+
+    Called on every stash so an edit takes effect on the next download without
+    a server restart. A missing, unreadable, or malformed file falls back to
+    the defaults — a bad config should never block a download."""
+    if not CONFIG_PATH.exists():
+        return DEFAULT_AUDIO_DIR, DEFAULT_VIDEO_DIR
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        dlog(f"config: cannot read {CONFIG_PATH} ({exc}); using defaults")
+        return DEFAULT_AUDIO_DIR, DEFAULT_VIDEO_DIR
+    if not isinstance(data, dict):
+        dlog(f"config: {CONFIG_PATH} is not a JSON object; using defaults")
+        return DEFAULT_AUDIO_DIR, DEFAULT_VIDEO_DIR
+    return (
+        _coerce_dir(data.get("audio_dir"), DEFAULT_AUDIO_DIR),
+        _coerce_dir(data.get("video_dir"), DEFAULT_VIDEO_DIR),
+    )
+
+
+def ensure_config_file():
+    """Write CONFIG_PATH with the current defaults if it does not exist yet, so
+    there is always a file to edit. Never overwrites an existing config."""
+    if CONFIG_PATH.exists():
+        return
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump({
+                "audio_dir": str(DEFAULT_AUDIO_DIR),
+                "video_dir": str(DEFAULT_VIDEO_DIR),
+            }, f, indent=2)
+            f.write("\n")
+        dlog(f"wrote default config to {CONFIG_PATH}")
+    except OSError as exc:
+        dlog(f"could not write default config to {CONFIG_PATH}: {exc}")
 
 
 def sanitize(name: str) -> str:
@@ -383,14 +454,19 @@ class MagpieHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # Prepare output path
-        dest_dir = DEST_DIR if is_audio else VIDEO_DEST_DIR
-        if not dest_dir.exists():
-            hint = " Open the Music app at least once to create this folder." if is_audio else ""
+        # Prepare output path. Config is read per request, so editing
+        # CONFIG_PATH takes effect on the next stash with no restart.
+        audio_dir, video_dir = load_config()
+        dest_dir = audio_dir if is_audio else video_dir
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            key = "audio_dir" if is_audio else "video_dir"
             send_progress({
                 "type": "done",
                 "ok": False,
-                "error": f"Destination folder not found: {dest_dir}.{hint}",
+                "error": f"Cannot use destination folder {dest_dir}: {exc}. "
+                         f"Check \"{key}\" in {CONFIG_PATH}.",
             })
             return
         if playlist:
@@ -477,11 +553,9 @@ class MagpieHandler(BaseHTTPRequestHandler):
         dlog(f"yt-dlp exited with code {proc.returncode}")
 
         if proc.returncode == 0:
-            if playlist:
-                dest_label = "Music library" if is_audio else "Movies folder"
-                message = f"Stashed playlist to {dest_label}"
-            else:
-                message = "Added to Music library" if is_audio else "Saved to Movies folder"
+            # Playlists return early via _download_playlist_parallel, so this
+            # path is always a single file.
+            message = f"Saved to {display_path(dest_dir)}"
             send_progress({"type": "done", "ok": True, "path": expected_path, "message": message})
         else:
             err_text = "\n".join(tail[-12:]) if tail else f"exit code {proc.returncode}"
@@ -579,7 +653,7 @@ class MagpieHandler(BaseHTTPRequestHandler):
             for f in as_completed(futures):
                 pass
 
-        dest_label = "Music library" if is_audio else "Movies folder"
+        dest_label = display_path(subfolder)
         if failed[0] == 0:
             msg = f"Stashed {total} tracks to {dest_label}"
             send_progress({"type": "done", "ok": True, "path": str(subfolder), "message": msg})
@@ -607,6 +681,15 @@ def write_token():
 def main():
     dlog(f"=== magpie_server.py {VERSION} starting ===")
     dlog(f"PATH={os.environ.get('PATH', '<unset>')}")
+
+    ensure_config_file()
+    audio_dir, video_dir = load_config()
+    dlog(f"config: {CONFIG_PATH}")
+    dlog(f"audio -> {audio_dir}")
+    dlog(f"video -> {video_dir}")
+    print(f"Config: {CONFIG_PATH}", flush=True)
+    print(f"  audio_dir: {audio_dir}", flush=True)
+    print(f"  video_dir: {video_dir}", flush=True)
 
     write_token()
 

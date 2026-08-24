@@ -35,29 +35,49 @@ Reload any YouTube video — the **Stash** button appears in the action bar.
 
 ## Download location
 
-By default, audio files are saved to:
+Save folders live in `~/.config/magpie.json`. The server writes it with these
+defaults the first time it starts:
 
-```
-~/Music/Music/Media.localized/Music/
-```
-
-To change this, edit **line 35** of `magpie_server.py`:
-
-```python
-DEST_DIR = HOME / "Music" / "Music" / "Media.localized" / "Music"
+```json
+{
+  "audio_dir": "/Users/you/Music",
+  "video_dir": "/Users/you/Movies"
+}
 ```
 
-Change it to any directory you want, e.g.:
+Edit either path to move where files land. The config is read fresh on every
+stash, so **no restart is needed** — the next download uses the new folder.
 
-```python
-DEST_DIR = HOME / "Downloads" / "Music"
+Rules:
+
+- Paths must be absolute. `~` is expanded; relative paths are ignored.
+- The folder is created if it doesn't exist.
+- A missing or malformed config falls back to the defaults rather than failing
+  the download. Check `make logs` if a path seems to be ignored.
+- Playlists get a subfolder named after the playlist, inside the folder above.
+
+To point somewhere else entirely:
+
+```json
+{
+  "audio_dir": "/Users/you/Downloads/Stashed",
+  "video_dir": "/Volumes/External/Video"
+}
 ```
 
-Then restart the server:
+### Auto-adding to the Music app
 
-```bash
-make restart
+The default `~/Music` is a plain folder — files land there but the Music app
+won't import them. To have macOS pick them up automatically, point `audio_dir`
+at the Music app's watched folder instead:
+
+```json
+{
+  "audio_dir": "/Users/you/Music/Music/Media.localized/Automatically Add to Music.localized"
+}
 ```
+
+That folder only exists once you've opened the Music app at least once.
 
 ## Usage
 
