@@ -32,15 +32,28 @@ from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from threading import Lock, Thread
 
+import magpie_ibroadcast
+
 VERSION = "2.0-http"
 
 HOME = Path.home()
+
+# Served at /magpie.user.js so Tampermonkey can update itself from disk. Without
+# it the copy running in the browser is a hand-paste that silently drifts from
+# this repo the moment either one changes.
+SCRIPT_DIR = Path(__file__).resolve().parent
+USERSCRIPT_PATH = SCRIPT_DIR / "magpie.user.js"
 
 # Destination folders. These are the fallbacks; load_config() lets a JSON file
 # at CONFIG_PATH override either one without touching this file.
 CONFIG_PATH = Path(os.environ.get("MAGPIE_CONFIG") or HOME / ".config" / "magpie.json")
 DEFAULT_AUDIO_DIR = HOME / "Music"
 DEFAULT_VIDEO_DIR = HOME / "Movies"
+
+# Back up stashed audio to iBroadcast. On by default, but a no-op until the
+# user has authorized: magpie_ibroadcast.backup() reports "disabled" when no
+# token is stored, and the stash carries on regardless.
+DEFAULT_IBROADCAST_UPLOAD = True
 
 YT_DLP_CANDIDATES = [
     "/opt/homebrew/bin/yt-dlp",
@@ -108,27 +121,44 @@ def _coerce_dir(value, default: Path) -> Path:
     return p
 
 
+def _coerce_bool(value, default: bool) -> bool:
+    """Accept a real JSON boolean only; anything else keeps the default."""
+    return value if isinstance(value, bool) else default
+
+
+def _config_defaults():
+    return {
+        "audio_dir": DEFAULT_AUDIO_DIR,
+        "video_dir": DEFAULT_VIDEO_DIR,
+        "ibroadcast_upload": DEFAULT_IBROADCAST_UPLOAD,
+    }
+
+
 def load_config():
-    """Return (audio_dir, video_dir) from CONFIG_PATH.
+    """Return the settings dict: audio_dir and video_dir as Paths, plus the
+    ibroadcast_upload flag.
 
     Called on every stash so an edit takes effect on the next download without
     a server restart. A missing, unreadable, or malformed file falls back to
     the defaults — a bad config should never block a download."""
+    defaults = _config_defaults()
     if not CONFIG_PATH.exists():
-        return DEFAULT_AUDIO_DIR, DEFAULT_VIDEO_DIR
+        return defaults
     try:
         with open(CONFIG_PATH) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
         dlog(f"config: cannot read {CONFIG_PATH} ({exc}); using defaults")
-        return DEFAULT_AUDIO_DIR, DEFAULT_VIDEO_DIR
+        return defaults
     if not isinstance(data, dict):
         dlog(f"config: {CONFIG_PATH} is not a JSON object; using defaults")
-        return DEFAULT_AUDIO_DIR, DEFAULT_VIDEO_DIR
-    return (
-        _coerce_dir(data.get("audio_dir"), DEFAULT_AUDIO_DIR),
-        _coerce_dir(data.get("video_dir"), DEFAULT_VIDEO_DIR),
-    )
+        return defaults
+    return {
+        "audio_dir": _coerce_dir(data.get("audio_dir"), DEFAULT_AUDIO_DIR),
+        "video_dir": _coerce_dir(data.get("video_dir"), DEFAULT_VIDEO_DIR),
+        "ibroadcast_upload": _coerce_bool(data.get("ibroadcast_upload"),
+                                          DEFAULT_IBROADCAST_UPLOAD),
+    }
 
 
 def ensure_config_file():
@@ -142,11 +172,52 @@ def ensure_config_file():
             json.dump({
                 "audio_dir": str(DEFAULT_AUDIO_DIR),
                 "video_dir": str(DEFAULT_VIDEO_DIR),
+                "ibroadcast_upload": DEFAULT_IBROADCAST_UPLOAD,
             }, f, indent=2)
             f.write("\n")
         dlog(f"wrote default config to {CONFIG_PATH}")
     except OSError as exc:
         dlog(f"could not write default config to {CONFIG_PATH}: {exc}")
+
+
+BACKUP_SUFFIXES = {
+    "uploaded": " · backed up to iBroadcast",
+    "skipped": " · already in iBroadcast",
+    "failed": " · iBroadcast backup failed",
+    # "disabled" says nothing: the user has not set it up, so mentioning it on
+    # every single stash would just be noise.
+}
+
+
+def run_backup(paths, enabled, is_audio, send_progress):
+    """Back up finished files to iBroadcast.
+
+    Returns (message_suffix, status, detail). The suffix is "" whenever nothing
+    was attempted, so a stash that predates setup reads exactly as it did
+    before this feature existed."""
+    if not enabled or not is_audio:
+        return "", "disabled", ""
+    send_progress({"type": "progress", "phase": "backing_up"})
+
+    def on_progress(done, total):
+        send_progress({"type": "progress", "phase": "backing_up",
+                       "current": done, "total": total})
+
+    status, detail = magpie_ibroadcast.backup(paths, dlog, on_progress)
+    dlog(f"ibroadcast backup: {status} — {detail}")
+    return BACKUP_SUFFIXES.get(status, ""), status, detail
+
+
+def attach_backup_error(done, status, detail):
+    """Carry the backup failure reason into the done payload.
+
+    The userscript shows it on hover and keeps the button in a failed state, so
+    the text has to survive the trip rather than only reaching the server log.
+    Success and 'not set up' add nothing."""
+    if status == "failed":
+        done["backup_status"] = "failed"
+        done["backup_error"] = detail or "iBroadcast upload failed"
+    return done
 
 
 def sanitize(name: str) -> str:
@@ -344,8 +415,30 @@ class MagpieHandler(BaseHTTPRequestHandler):
             self._handle_health()
         elif self.path == "/token":
             self._handle_token()
+        elif self.path.split("?")[0] == "/magpie.user.js":
+            self._handle_userscript()
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _handle_userscript(self):
+        """Serve magpie.user.js so Tampermonkey installs and updates from disk.
+
+        No auth: Tampermonkey's updater sends no headers we control, and the
+        listener is loopback-only anyway."""
+        try:
+            body = USERSCRIPT_PATH.read_bytes()
+        except OSError as exc:
+            dlog(f"cannot read userscript at {USERSCRIPT_PATH}: {exc}")
+            self._send_json(404, {"error": f"userscript not readable: {exc}"})
+            return
+        self.send_response(200)
+        # Tampermonkey requires this content type to treat the response as a
+        # script rather than offering it as a download.
+        self.send_header("Content-Type", "application/javascript; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         if self.path == "/stash":
@@ -477,8 +570,8 @@ class MagpieHandler(BaseHTTPRequestHandler):
 
         # Prepare output path. Config is read per request, so editing
         # CONFIG_PATH takes effect on the next stash with no restart.
-        audio_dir, video_dir = load_config()
-        dest_dir = audio_dir if is_audio else video_dir
+        config = load_config()
+        dest_dir = config["audio_dir"] if is_audio else config["video_dir"]
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -491,7 +584,8 @@ class MagpieHandler(BaseHTTPRequestHandler):
             })
             return
         if playlist:
-            self._download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp, send_progress)
+            self._download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
+                                             send_progress, config["ibroadcast_upload"])
             return
 
         output_template = str(dest_dir / f"{name}.%(ext)s")
@@ -578,17 +672,23 @@ class MagpieHandler(BaseHTTPRequestHandler):
             # path is always a single file. Match on the stash name instead of
             # expected_path: yt-dlp lands on a different extension whenever the
             # audio conversion is skipped, and that file needs clearing too.
-            for produced in dest_dir.iterdir():
-                if produced.is_file() and produced.name.startswith(name + "."):
-                    strip_quarantine(produced)
-            message = f"Saved to {display_path(dest_dir)}"
-            send_progress({"type": "done", "ok": True, "path": expected_path, "message": message})
+            produced = [p for p in dest_dir.iterdir()
+                        if p.is_file() and p.name.startswith(name + ".")]
+            for p in produced:
+                strip_quarantine(p)
+            suffix, backup_status, backup_detail = run_backup(
+                produced, config["ibroadcast_upload"], is_audio, send_progress)
+            message = f"Saved to {display_path(dest_dir)}{suffix}"
+            send_progress(attach_backup_error(
+                {"type": "done", "ok": True, "path": expected_path, "message": message},
+                backup_status, backup_detail))
         else:
             err_text = "\n".join(tail[-12:]) if tail else f"exit code {proc.returncode}"
             err_text += f"\n\n[ran: {' '.join(cmd)}]"
             send_progress({"type": "done", "ok": False, "error": err_text})
 
-    def _download_playlist_parallel(self, url, name, is_audio, dest_dir, ffmpeg, yt_dlp, send_progress):
+    def _download_playlist_parallel(self, url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
+                                    send_progress, ibroadcast_upload=False):
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         send_progress({"type": "progress", "phase": "loading"})
@@ -679,17 +779,21 @@ class MagpieHandler(BaseHTTPRequestHandler):
             for f in as_completed(futures):
                 pass
 
-        for produced in subfolder.iterdir():
-            if produced.is_file():
-                strip_quarantine(produced)
+        produced = [p for p in subfolder.iterdir() if p.is_file()]
+        for p in produced:
+            strip_quarantine(p)
 
         dest_label = display_path(subfolder)
         if failed[0] == 0:
             msg = f"Stashed {total} tracks to {dest_label}"
-            send_progress({"type": "done", "ok": True, "path": str(subfolder), "message": msg})
         else:
             msg = f"Stashed {completed[0]}/{total} to {dest_label} ({failed[0]} failed)"
-            send_progress({"type": "done", "ok": completed[0] > 0, "path": str(subfolder), "message": msg})
+        suffix, backup_status, backup_detail = run_backup(
+            produced, ibroadcast_upload, is_audio, send_progress)
+        send_progress(attach_backup_error(
+            {"type": "done", "ok": failed[0] == 0 or completed[0] > 0,
+             "path": str(subfolder), "message": msg + suffix},
+            backup_status, backup_detail))
 
 
 # ---------------------------------------------------------------------------
@@ -713,13 +817,21 @@ def main():
     dlog(f"PATH={os.environ.get('PATH', '<unset>')}")
 
     ensure_config_file()
-    audio_dir, video_dir = load_config()
+    config = load_config()
+    if not config["ibroadcast_upload"]:
+        backup_state = "off (ibroadcast_upload is false)"
+    elif magpie_ibroadcast.load_token() is None:
+        backup_state = "on, but not authorized yet — run: make ibroadcast-login"
+    else:
+        backup_state = "on"
     dlog(f"config: {CONFIG_PATH}")
-    dlog(f"audio -> {audio_dir}")
-    dlog(f"video -> {video_dir}")
+    dlog(f"audio -> {config['audio_dir']}")
+    dlog(f"video -> {config['video_dir']}")
+    dlog(f"ibroadcast backup: {backup_state}")
     print(f"Config: {CONFIG_PATH}", flush=True)
-    print(f"  audio_dir: {audio_dir}", flush=True)
-    print(f"  video_dir: {video_dir}", flush=True)
+    print(f"  audio_dir: {config['audio_dir']}", flush=True)
+    print(f"  video_dir: {config['video_dir']}", flush=True)
+    print(f"  ibroadcast backup: {backup_state}", flush=True)
 
     write_token()
 

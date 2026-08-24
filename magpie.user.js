@@ -1,14 +1,21 @@
 // ==UserScript==
 // @name         Magpie
 // @namespace    com.magpie.stash
-// @version      2.0
+// @version      2.3.0
 // @description  One-click YouTube audio/video stash via local server
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
 // @run-at       document-idle
+// @updateURL    http://127.0.0.1:7865/magpie.user.js
+// @downloadURL  http://127.0.0.1:7865/magpie.user.js
 // ==/UserScript==
+
+// Install this from http://127.0.0.1:7865/magpie.user.js, not by pasting it.
+// Installed that way, Tampermonkey re-reads this file from the Magpie server,
+// so an edit here actually reaches the browser. Tampermonkey only applies an
+// update when @version increases — bump it on every change to this file.
 
 (function () {
   'use strict';
@@ -65,23 +72,47 @@
     } else {
       parent.appendChild(el);
     }
+    attachErrorTip(el);
     return el;
   }
 
-  function showStashed(message) {
+  function showStashed(message, opts = {}) {
     const el = ensureStatusEl();
     el.innerHTML = '';
+    el.title = '';
+    el._error = '';
+    el.style.cursor = '';
+    hideErrorTip();
 
-    const check = document.createElement('span');
-    check.textContent = '✓';
-    check.style.cssText = 'color: #4ade80; font-weight: 700; margin-right: 8px;';
+    const failed = !!opts.failed;
+
+    const mark = document.createElement('span');
+    mark.textContent = failed ? '⚠' : '✓';
+    mark.style.cssText =
+      'font-weight: 700; margin-right: 8px; color: ' + (failed ? '#f87171' : '#4ade80') + ';';
 
     const label = document.createElement('span');
-    label.textContent = message || 'Added to Music library';
+    label.textContent = message || (failed ? 'Stash failed' : 'Stashed');
     label.style.cssText = 'color: rgba(255,255,255,0.85); font-weight: 500;';
 
-    el.appendChild(check);
+    el.appendChild(mark);
     el.appendChild(label);
+
+    if (opts.detail) {
+      // Hovering anywhere on the row reveals the full error, including
+      // multi-line output from yt-dlp.
+      el._error = String(opts.detail);
+      el.title = el._error;
+      el.style.cursor = 'help';
+      label.style.textDecoration = 'underline dotted rgba(255,255,255,0.45)';
+      label.style.textUnderlineOffset = '3px';
+
+      const hint = document.createElement('span');
+      hint.textContent = ' — hover for details';
+      hint.style.cssText = 'color: rgba(255,255,255,0.45); font-size: 12px;';
+      el.appendChild(hint);
+    }
+
     el.style.display = 'block';
   }
 
@@ -100,10 +131,13 @@
     const main = btn.querySelector('.magpie-main');
     if (span) span.textContent = text;
     const isDefault = text === (btn._defaultLabel || BASE_LABEL);
+    // A stuck failure keeps the format dropdown reachable, so the next attempt
+    // can use a different format without waiting for the label to reset.
+    const showChevron = isDefault || !!opts.keepChevron;
     if (svg) svg.style.display = isDefault ? '' : 'none';
-    if (divider) divider.style.display = isDefault ? '' : 'none';
-    if (chev) chev.style.display = isDefault ? '' : 'none';
-    if (main) main.style.paddingRight = isDefault ? '12px' : '16px';
+    if (divider) divider.style.display = showChevron ? '' : 'none';
+    if (chev) chev.style.display = showChevron ? '' : 'none';
+    if (main) main.style.paddingRight = showChevron ? '12px' : '16px';
     btn._disabled = !!opts.disabled;
     btn.style.opacity = opts.disabled ? '0.85' : '1';
     btn.style.cursor = opts.disabled ? 'wait' : 'pointer';
@@ -113,6 +147,86 @@
   function flash(btn, text, color, ms = 2500) {
     setLabel(btn, text, { color });
     setTimeout(() => setLabel(btn, btn._defaultLabel || BASE_LABEL, { color: 'rgba(255,255,255,0.1)' }), ms);
+  }
+
+  // ---- Error tooltip --------------------------------------------------------
+  //
+  // A native title= tooltip waits about a second before appearing and is easy
+  // to miss, which made the error look like it was never there. This one shows
+  // on the first hover with no delay.
+
+  const TIP_ID = 'magpie-error-tip';
+
+  function hideErrorTip() {
+    const tip = document.getElementById(TIP_ID);
+    if (tip) tip.remove();
+  }
+
+  function showErrorTip(anchor, text) {
+    hideErrorTip();
+    if (!text || !anchor || !anchor.isConnected) return;
+
+    const tip = document.createElement('div');
+    tip.id = TIP_ID;
+    tip.textContent = String(text);
+    tip.style.cssText = `
+      position: fixed;
+      top: 0;
+      left: 0;
+      max-width: 460px;
+      background: #1c1c1c;
+      color: rgba(255,255,255,0.92);
+      border: 1px solid rgba(255,255,255,0.16);
+      border-left: 3px solid #f87171;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      z-index: 2147483647;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.55);
+      pointer-events: none;
+    `;
+    document.body.appendChild(tip);
+
+    // Measure first, then place, so a tall error near the bottom of the window
+    // flips above the button instead of running off screen.
+    const a = anchor.getBoundingClientRect();
+    const t = tip.getBoundingClientRect();
+    let top = a.bottom + 8;
+    if (top + t.height > window.innerHeight - 8) top = a.top - t.height - 8;
+    let left = a.left;
+    if (left + t.width > window.innerWidth - 8) left = window.innerWidth - t.width - 8;
+    tip.style.top = Math.max(8, top) + 'px';
+    tip.style.left = Math.max(8, left) + 'px';
+    return tip;
+  }
+
+  function attachErrorTip(el) {
+    el.addEventListener('mouseenter', () => {
+      if (el._error) showErrorTip(el, el._error);
+    });
+    el.addEventListener('mouseleave', hideErrorTip);
+  }
+
+  // Failures stay put. A message that clears itself after a few seconds takes
+  // the reason with it, so the button holds the failed state until the next
+  // stash and keeps the full error one hover away.
+  function setFailure(btn, text, detail, color = '#7a2a2a') {
+    setLabel(btn, text, { color, keepChevron: true });
+    btn._failed = true;
+    btn._error = detail ? String(detail) : '';
+    btn.title = btn._error;  // fallback if the custom tip fails to mount
+    if (detail) console.error('[Magpie]', detail);
+  }
+
+  function clearFailure(btn) {
+    btn._failed = false;
+    btn._error = '';
+    btn.title = '';
+    hideErrorTip();
   }
 
   function progressLabel(msg) {
@@ -185,13 +299,18 @@
   }
 
   function stashViaServer(btn, url, name, format, playlist) {
+    clearFailure(btn);
     setLabel(btn, '⌛ Starting…', { disabled: true, color: '#3f3f3f' });
     LOG('sending stash request to local server', { url, name });
 
     fetchToken(function (token) {
       if (!token) {
         LOG('no auth token available');
-        flash(btn, '⚠️ No server', '#7a2a2a', 4000);
+        const why = 'No response from ' + SERVER +
+                    '\n\nStart it with:   make start' +
+                    '\nCheck it with:   make status';
+        setFailure(btn, '⚠️ No server', why);
+        showStashed('Magpie server not reachable', { failed: true, detail: why });
         return;
       }
 
@@ -204,6 +323,13 @@
           if (msg.phase === 'playlist_item') {
             playlistInfo = msg.current + '/' + msg.total + ' — ';
             setLabel(btn, '⌛ ' + msg.current + '/' + msg.total, { disabled: true, color: '#3f3f3f' });
+          } else if (msg.phase === 'backing_up') {
+            // Downloading has finished by this point, so drop the "12/12 — "
+            // download prefix instead of stacking two counters on the button.
+            playlistInfo = '';
+            const many = typeof msg.current === 'number' && msg.total > 1;
+            const count = many ? ' ' + msg.current + '/' + msg.total : '';
+            setLabel(btn, '⌛ Backing up' + count + '…', { disabled: true, color: '#3f3f3f' });
           } else {
             const label = progressLabel(msg);
             if (playlistInfo) {
@@ -214,14 +340,20 @@
           }
         } else if (msg.type === 'done') {
           finished = true;
-          if (msg.ok) {
+          if (msg.ok && msg.backup_status === 'failed') {
+            // The local file saved fine — only the iBroadcast copy failed, so
+            // this stays a warning about the backup, not about the stash.
+            LOG('saved, but backup failed:', msg.path);
+            setFailure(btn, '⚠️ Backup failed', msg.backup_error);
+            showStashed(msg.message, { failed: true, detail: msg.backup_error });
+          } else if (msg.ok) {
             LOG('saved:', msg.path);
             flash(btn, '✅ Stashed', '#2a6a2a');
             showStashed(msg.message);
           } else {
             LOG('server error:', msg.error);
-            flash(btn, '⚠️ Failed', '#7a2a2a', 4000);
-            if (msg.error) console.error('[Magpie]', msg.error);
+            setFailure(btn, '⚠️ Failed', msg.error);
+            showStashed('Stash failed', { failed: true, detail: msg.error });
           }
         }
       }
@@ -250,10 +382,17 @@
           if (!finished) {
             if (response.status >= 200 && response.status < 300) {
               LOG('stream ended without explicit done message');
-              flash(btn, '⚠️ Unknown', '#7a5a2a', 3000);
+              const why = 'The server closed the connection without reporting a ' +
+                          'result.\nThe file may or may not have saved.' +
+                          '\n\nCheck with:   make logs';
+              setFailure(btn, '⚠️ Unknown', why, '#7a5a2a');
+              showStashed('Stash result unknown', { failed: true, detail: why });
             } else {
               LOG('server returned status', response.status);
-              flash(btn, '⚠️ Failed', '#7a2a2a', 4000);
+              const why = 'Server returned HTTP ' + response.status +
+                          '\n\n' + (response.responseText || '(no body)');
+              setFailure(btn, '⚠️ Failed', why);
+              showStashed('Stash failed', { failed: true, detail: why });
             }
           }
         }
@@ -261,14 +400,22 @@
 
       onerror: function (response) {
         if (finished) return;
-        LOG('request error:', response.statusText || 'connection failed');
-        flash(btn, '⚠️ Error', '#7a2a2a');
+        const why = 'Could not reach ' + SERVER + '\n' +
+                    (response && response.statusText ? response.statusText : 'connection failed') +
+                    '\n\nCheck it with:   make status';
+        LOG('request error:', why);
+        setFailure(btn, '⚠️ Error', why);
+        showStashed('Stash failed', { failed: true, detail: why });
       },
 
       ontimeout: function () {
         if (finished) return;
+        const limit = playlist ? '60 minutes' : '10 minutes';
+        const why = 'The server did not finish within ' + limit + '.' +
+                    '\n\nCheck what it was doing:   make logs';
         LOG('request timed out');
-        flash(btn, '⚠️ Timeout', '#7a2a2a');
+        setFailure(btn, '⚠️ Timeout', why);
+        showStashed('Stash timed out', { failed: true, detail: why });
       },
 
       timeout: playlist ? 3600000 : 600000
@@ -456,6 +603,7 @@
 
     wrap._formatKey = 'magpie-format';
     wrap._defaultLabel = BASE_LABEL;
+    attachErrorTip(wrap);
 
     return wrap;
   }
@@ -586,6 +734,7 @@
 
     wrap._formatKey = 'magpie-playlist-format';
     wrap._defaultLabel = 'Stash Playlist';
+    attachErrorTip(wrap);
 
     return wrap;
   }
@@ -700,6 +849,7 @@
       const popover = document.getElementById('magpie-format-popover');
       if (popover) popover.remove();
       document.querySelectorAll('.' + PLAYLIST_CLASS).forEach((b) => b.remove());
+      hideErrorTip();
     }
 
     injectPlaylistButton();
