@@ -134,6 +134,43 @@ The Stash button shows `Backing up…` during the upload, then one of:
 | `Saved to ~/Music · iBroadcast backup failed` | local file is fine, upload isn't |
 | `Saved to ~/Music` | backup is off, or not set up yet |
 
+## Track names and tags
+
+Name a stash `{Album}_{Track}` and Magpie writes real tags into the file before
+it uploads:
+
+```
+AC_Mirage_Escape.mp3        album = AC        title = Mirage_Escape
+WetLeg_NotFun.mp3           album = WetLeg    title = NotFun
+Espresso.mp3                (no album)        title = Espresso
+```
+
+The split is on the **first** underscore. A name with no underscore gets a
+title only — inventing an album from a single word is worse than leaving it
+unset.
+
+This matters because yt-dlp leaves downloads with no tags at all. Untagged
+files show up in iBroadcast as "Unknown Album" with the filename as the title,
+so a stash saved as `Foo.mp3.m4a` would appear as `Music/Foo.mp3`.
+
+**Album aliases** fold related prefixes into one album. Every Assassin's Creed
+numbering lands under `AC`:
+
+```json
+{
+  "album_aliases": {
+    "AC": "AC", "AC2": "AC", "AC3": "AC", "AC4": "AC", "ACB": "AC"
+  }
+}
+```
+
+Add your own — `"Bond2": "Bond"` and so on. Set `"tag_from_filename": false` to
+turn tagging off entirely.
+
+Tagging is a stream copy, so the audio is never re-encoded. Embedded cover art
+is preserved where the container allows it. A tagging failure never fails a
+stash: an untagged file is still a good file.
+
 ## When something fails
 
 Failures stay on screen. The button holds its failed state — `⚠️ Failed`,

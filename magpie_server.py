@@ -33,6 +33,7 @@ from pathlib import Path
 from threading import Lock, Thread
 
 import magpie_ibroadcast
+import magpie_tags
 
 VERSION = "2.0-http"
 
@@ -54,6 +55,18 @@ DEFAULT_VIDEO_DIR = HOME / "Movies"
 # user has authorized: magpie_ibroadcast.backup() reports "disabled" when no
 # token is stored, and the stash carries on regardless.
 DEFAULT_IBROADCAST_UPLOAD = True
+
+# YouTube 403s the audio stream for most yt-dlp player clients. web_embedded is
+# what currently gets served; "default" trails it so yt-dlp can still fall back.
+# YouTube changes this often — override youtube_player_client in the config
+# rather than editing here, and check `yt-dlp --extractor-args help` for names.
+DEFAULT_YT_PLAYER_CLIENT = "web_embedded,default"
+
+# Write album/title tags from the {Album}_{Track} filename before uploading.
+# yt-dlp leaves downloads untagged, and iBroadcast then falls back to the
+# filename — which is how the library filled up with "Unknown Album".
+DEFAULT_TAG_FROM_FILENAME = True
+DEFAULT_ALBUM_ALIASES = magpie_tags.DEFAULT_ALBUM_ALIASES
 
 YT_DLP_CANDIDATES = [
     "/opt/homebrew/bin/yt-dlp",
@@ -126,12 +139,36 @@ def _coerce_bool(value, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
 
+def _coerce_str(value, default: str) -> str:
+    """Accept a non-empty string only; anything else keeps the default."""
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _coerce_aliases(value, default: dict) -> dict:
+    """Accept a flat string->string map only; anything else keeps the default."""
+    if not isinstance(value, dict):
+        return default
+    clean = {str(k): str(v) for k, v in value.items()
+             if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
+    return clean or default
+
+
 def _config_defaults():
     return {
         "audio_dir": DEFAULT_AUDIO_DIR,
         "video_dir": DEFAULT_VIDEO_DIR,
         "ibroadcast_upload": DEFAULT_IBROADCAST_UPLOAD,
+        "youtube_player_client": DEFAULT_YT_PLAYER_CLIENT,
+        "tag_from_filename": DEFAULT_TAG_FROM_FILENAME,
+        "album_aliases": dict(DEFAULT_ALBUM_ALIASES),
     }
+
+
+def player_client_args(client):
+    """yt-dlp flags selecting the YouTube player client, or none if disabled."""
+    if not client or client.lower() in ("", "default", "none", "auto"):
+        return []
+    return ["--extractor-args", shlex.quote(f"youtube:player_client={client}")]
 
 
 def load_config():
@@ -158,6 +195,12 @@ def load_config():
         "video_dir": _coerce_dir(data.get("video_dir"), DEFAULT_VIDEO_DIR),
         "ibroadcast_upload": _coerce_bool(data.get("ibroadcast_upload"),
                                           DEFAULT_IBROADCAST_UPLOAD),
+        "youtube_player_client": _coerce_str(data.get("youtube_player_client"),
+                                             DEFAULT_YT_PLAYER_CLIENT),
+        "tag_from_filename": _coerce_bool(data.get("tag_from_filename"),
+                                          DEFAULT_TAG_FROM_FILENAME),
+        "album_aliases": _coerce_aliases(data.get("album_aliases"),
+                                         dict(DEFAULT_ALBUM_ALIASES)),
     }
 
 
@@ -173,6 +216,9 @@ def ensure_config_file():
                 "audio_dir": str(DEFAULT_AUDIO_DIR),
                 "video_dir": str(DEFAULT_VIDEO_DIR),
                 "ibroadcast_upload": DEFAULT_IBROADCAST_UPLOAD,
+                "youtube_player_client": DEFAULT_YT_PLAYER_CLIENT,
+                "tag_from_filename": DEFAULT_TAG_FROM_FILENAME,
+                "album_aliases": dict(DEFAULT_ALBUM_ALIASES),
             }, f, indent=2)
             f.write("\n")
         dlog(f"wrote default config to {CONFIG_PATH}")
@@ -187,6 +233,17 @@ BACKUP_SUFFIXES = {
     # "disabled" says nothing: the user has not set it up, so mentioning it on
     # every single stash would just be noise.
 }
+
+
+def tag_downloads(paths, config, ffmpeg, is_audio):
+    """Tag finished audio from its {Album}_{Track} filename.
+
+    Runs before the iBroadcast upload so the library gets real album and title
+    values instead of falling back to the filename. A tagging failure is never
+    fatal — an untagged file is still a good file."""
+    if not is_audio or not config.get("tag_from_filename"):
+        return
+    magpie_tags.tag_all(paths, ffmpeg, config.get("album_aliases"), dlog)
 
 
 def run_backup(paths, enabled, is_audio, send_progress):
@@ -220,9 +277,30 @@ def attach_backup_error(done, status, detail):
     return done
 
 
+MEDIA_SUFFIXES = (".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus",
+                  ".mp4", ".mkv", ".webm", ".mov")
+
+
 def sanitize(name: str) -> str:
+    """Clean a user-supplied filename.
+
+    A trailing media extension is dropped. yt-dlp appends the real extension
+    itself, so "Song.mp3" typed at the prompt would otherwise be saved as
+    "Song.mp3.m4a" — a name that lies about the contents, which is what broke
+    the Music app import and left junk titles in the iBroadcast library."""
     bad = '/\\:*?"<>|'
     cleaned = "".join(c for c in name if c not in bad).strip()
+    # Repeat: "Song.mp3.m4a" must not become "Song.mp3" and then "Song.mp3.mp3".
+    # Each pass removes at least one character, so this always terminates.
+    stripping = True
+    while stripping:
+        stripping = False
+        lower = cleaned.lower()
+        for suffix in MEDIA_SUFFIXES:
+            if lower.endswith(suffix) and len(cleaned) > len(suffix):
+                cleaned = cleaned[:-len(suffix)].strip()
+                stripping = True
+                break
     return cleaned or "audio"
 
 
@@ -585,7 +663,7 @@ class MagpieHandler(BaseHTTPRequestHandler):
             return
         if playlist:
             self._download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
-                                             send_progress, config["ibroadcast_upload"])
+                                             send_progress, config)
             return
 
         output_template = str(dest_dir / f"{name}.%(ext)s")
@@ -601,6 +679,7 @@ class MagpieHandler(BaseHTTPRequestHandler):
             shlex.quote(yt_dlp),
             *format_args,
             *playlist_args,
+            *player_client_args(config["youtube_player_client"]),
             "--newline",
             "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
             "-o", shlex.quote(output_template),
@@ -676,6 +755,7 @@ class MagpieHandler(BaseHTTPRequestHandler):
                         if p.is_file() and p.name.startswith(name + ".")]
             for p in produced:
                 strip_quarantine(p)
+            tag_downloads(produced, config, ffmpeg, is_audio)
             suffix, backup_status, backup_detail = run_backup(
                 produced, config["ibroadcast_upload"], is_audio, send_progress)
             message = f"Saved to {display_path(dest_dir)}{suffix}"
@@ -688,14 +768,17 @@ class MagpieHandler(BaseHTTPRequestHandler):
             send_progress({"type": "done", "ok": False, "error": err_text})
 
     def _download_playlist_parallel(self, url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
-                                    send_progress, ibroadcast_upload=False):
+                                    send_progress, config):
         from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        player_client = config["youtube_player_client"]
 
         send_progress({"type": "progress", "phase": "loading"})
 
         flat_cmd = ["/bin/zsh", "-l", "-c", " ".join([
             shlex.quote(yt_dlp),
             "--flat-playlist", "--dump-json",
+            *player_client_args(player_client),
             shlex.quote(url),
         ])]
         dlog(f"extracting playlist: {flat_cmd}")
@@ -750,6 +833,7 @@ class MagpieHandler(BaseHTTPRequestHandler):
                 shlex.quote(yt_dlp),
                 *fmt_args,
                 "--no-playlist",
+                *player_client_args(player_client),
                 "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
                 "-o", shlex.quote(template),
                 shlex.quote(video_url),
@@ -782,6 +866,7 @@ class MagpieHandler(BaseHTTPRequestHandler):
         produced = [p for p in subfolder.iterdir() if p.is_file()]
         for p in produced:
             strip_quarantine(p)
+        tag_downloads(produced, config, ffmpeg, is_audio)
 
         dest_label = display_path(subfolder)
         if failed[0] == 0:
@@ -789,7 +874,7 @@ class MagpieHandler(BaseHTTPRequestHandler):
         else:
             msg = f"Stashed {completed[0]}/{total} to {dest_label} ({failed[0]} failed)"
         suffix, backup_status, backup_detail = run_backup(
-            produced, ibroadcast_upload, is_audio, send_progress)
+            produced, config["ibroadcast_upload"], is_audio, send_progress)
         send_progress(attach_backup_error(
             {"type": "done", "ok": failed[0] == 0 or completed[0] > 0,
              "path": str(subfolder), "message": msg + suffix},
