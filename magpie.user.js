@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Magpie
 // @namespace    com.magpie.stash
-// @version      2.3.0
+// @version      2.4.0
 // @description  One-click YouTube audio/video stash via local server
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -348,7 +348,7 @@
             showStashed(msg.message, { failed: true, detail: msg.backup_error });
           } else if (msg.ok) {
             LOG('saved:', msg.path);
-            flash(btn, '✅ Stashed', '#2a6a2a');
+            setLabel(btn, '✅ Stashed', { color: '#2a6a2a' });
             showStashed(msg.message);
           } else {
             LOG('server error:', msg.error);
@@ -480,6 +480,100 @@
     setTimeout(() => document.addEventListener('click', dismiss, true), 0);
   }
 
+  // ---- Duplicate check + resolution dialog ---------------------------------
+
+  function checkDupe(token, name, format, callback) {
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: SERVER + '/check-dupe',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      data: JSON.stringify({ name: name, format: format }),
+      onload: function (response) {
+        try {
+          var data = JSON.parse(response.responseText);
+          callback(data);
+        } catch (e) {
+          callback({ duplicate: false });
+        }
+      },
+      onerror: function () {
+        callback({ duplicate: false });
+      }
+    });
+  }
+
+  const DUPE_DIALOG_ID = 'magpie-dupe-dialog';
+
+  function showDupeDialog(name, foundIn, onOverwrite, onRename, onCancel) {
+    var old = document.getElementById(DUPE_DIALOG_ID);
+    if (old) old.remove();
+
+    var where = foundIn.join(' and ');
+
+    var overlay = document.createElement('div');
+    overlay.id = DUPE_DIALOG_ID;
+    overlay.style.cssText =
+      'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:2147483647;' +
+      'display:flex;align-items:center;justify-content:center;';
+
+    var box = document.createElement('div');
+    box.style.cssText =
+      'background:#1e1e1e;border:1px solid rgba(255,255,255,0.15);border-radius:14px;' +
+      'padding:24px 28px 20px;max-width:420px;width:90%;color:rgba(255,255,255,0.9);' +
+      'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;' +
+      'font-size:14px;line-height:1.5;box-shadow:0 12px 40px rgba(0,0,0,0.6);';
+
+    var title = document.createElement('div');
+    title.textContent = 'Duplicate found';
+    title.style.cssText = 'font-size:16px;font-weight:600;margin-bottom:8px;';
+
+    var msg = document.createElement('div');
+    msg.style.cssText = 'color:rgba(255,255,255,0.7);margin-bottom:20px;word-break:break-word;';
+    msg.innerHTML = '<b style="color:rgba(255,255,255,0.9)">' +
+      name.replace(/</g, '&lt;') + '</b> already exists in <b style="color:rgba(255,255,255,0.9)">' +
+      where + '</b>.';
+
+    var btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;';
+
+    function makeBtn(label, bg, fg) {
+      var b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText =
+        'padding:8px 16px;border:none;border-radius:8px;font-size:13px;font-weight:500;' +
+        'cursor:pointer;font-family:inherit;background:' + bg + ';color:' + fg + ';';
+      b.addEventListener('mouseenter', function () { b.style.opacity = '0.85'; });
+      b.addEventListener('mouseleave', function () { b.style.opacity = '1'; });
+      return b;
+    }
+
+    var cancelBtn = makeBtn('Cancel', 'rgba(255,255,255,0.1)', 'rgba(255,255,255,0.8)');
+    var renameBtn = makeBtn('Rename', 'rgba(255,255,255,0.1)', '#3ea6ff');
+    var overwriteBtn = makeBtn('Overwrite', '#b33', '#fff');
+
+    function dismiss() { overlay.remove(); }
+
+    cancelBtn.addEventListener('click', function () { dismiss(); onCancel(); });
+    renameBtn.addEventListener('click', function () { dismiss(); onRename(); });
+    overwriteBtn.addEventListener('click', function () { dismiss(); onOverwrite(); });
+
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) { dismiss(); onCancel(); }
+    });
+
+    btnRow.appendChild(cancelBtn);
+    btnRow.appendChild(renameBtn);
+    btnRow.appendChild(overwriteBtn);
+    box.appendChild(title);
+    box.appendChild(msg);
+    box.appendChild(btnRow);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  }
+
   // ---- Build button ---------------------------------------------------------
 
   function buildButton() {
@@ -588,11 +682,33 @@
       const url = window.location.href;
       const rawTitle = document.title.replace(/ - YouTube$/, '').trim();
       const safeDefault = rawTitle.replace(/[\/\\:*?"<>|]/g, '').trim();
-      const filename = window.prompt('Save as (without ' + ext + '):', safeDefault);
-      if (!filename) return;
-      const cleaned = filename.trim();
-      if (!cleaned) return;
-      stashViaServer(wrap, url, cleaned, format);
+
+      function promptAndStash(defaultName) {
+        const filename = window.prompt('Save as (without ' + ext + '):', defaultName);
+        if (!filename) return;
+        const cleaned = filename.trim();
+        if (!cleaned) return;
+
+        fetchToken(function (token) {
+          if (!token) {
+            stashViaServer(wrap, url, cleaned, format);
+            return;
+          }
+          checkDupe(token, cleaned, format, function (result) {
+            if (!result.duplicate) {
+              stashViaServer(wrap, url, cleaned, format);
+              return;
+            }
+            showDupeDialog(cleaned, result.found_in,
+              function () { stashViaServer(wrap, url, cleaned, format); },
+              function () { promptAndStash(cleaned); },
+              function () {}
+            );
+          });
+        });
+      }
+
+      promptAndStash(safeDefault);
     });
 
     chevron.addEventListener('click', (e) => {

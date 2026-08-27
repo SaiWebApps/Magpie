@@ -536,6 +536,8 @@ class MagpieHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/stash":
             self._handle_stash()
+        elif self.path == "/check-dupe":
+            self._handle_check_dupe()
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -548,6 +550,47 @@ class MagpieHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "token endpoint is only available from localhost"})
             return
         self._send_json(200, {"token": AUTH_TOKEN})
+
+    def _handle_check_dupe(self):
+        """Check whether a name already exists locally or in iBroadcast."""
+        if not self._check_auth():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._send_json(400, {"error": "empty body"})
+            return
+
+        try:
+            raw = self.rfile.read(content_length)
+            body = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+
+        name = sanitize(body.get("name", ""))
+        format = body.get("format", "mp3")
+        if not name:
+            self._send_json(400, {"error": "missing name"})
+            return
+
+        is_audio = format == "mp3"
+        config = load_config()
+        dest_dir = config["audio_dir"] if is_audio else config["video_dir"]
+
+        found_in = []
+
+        local_path = dest_dir / f"{name}.{format}"
+        if local_path.exists():
+            found_in.append("local")
+
+        if is_audio:
+            ibc_names = magpie_ibroadcast.load_uploaded_names()
+            if name in ibc_names:
+                found_in.append("ibroadcast")
+
+        self._send_json(200, {"duplicate": len(found_in) > 0, "found_in": found_in, "name": name})
 
     def _handle_stash(self):
         """Accept a download request and stream progress via SSE."""

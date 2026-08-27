@@ -46,6 +46,9 @@ TOKEN_PATH = Path(os.environ.get("MAGPIE_IBROADCAST_TOKEN")
 SENT_PATH = Path(os.environ.get("MAGPIE_IBROADCAST_SENT")
                  or HOME / ".config" / "magpie-ibroadcast-sent.json")
 
+NAMES_PATH = Path(os.environ.get("MAGPIE_IBROADCAST_NAMES")
+                  or HOME / ".config" / "magpie-ibroadcast-names.json")
+
 # iBroadcast is a music service; video stashes are never sent.
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".wma", ".aiff"}
 
@@ -315,6 +318,29 @@ def record_sent(digests):
         pass
 
 
+def load_uploaded_names():
+    """Return the set of basenames (without extension) uploaded to iBroadcast."""
+    try:
+        with open(NAMES_PATH) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    return set(data) if isinstance(data, list) else set()
+
+
+def record_uploaded_names(names):
+    """Add basenames to the local record of what has been uploaded."""
+    if not names:
+        return
+    merged = load_uploaded_names() | set(names)
+    try:
+        NAMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(NAMES_PATH, "w") as f:
+            json.dump(sorted(merged), f)
+    except OSError:
+        pass
+
+
 def already_uploaded(token):
     """Everything known to be in the library: the server's index plus what this
     machine has sent recently but the server may not have indexed yet."""
@@ -398,6 +424,8 @@ def backup(paths, log=lambda m: None, progress=lambda done, total: None):
             uploaded += 1
 
         if uploaded:
+            new_names = [p.stem for p in audio]
+            record_uploaded_names(new_names)
             return "uploaded", f"{uploaded} uploaded, {skipped} already there"
         return "skipped", f"already in library ({skipped})"
     except IBroadcastError as exc:
