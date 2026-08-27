@@ -4,6 +4,35 @@
 YouTube audio/video stash tool. Two components:
 - `magpie.user.js` — Tampermonkey userscript (injects download buttons on YouTube)
 - `magpie_server.py` — Local HTTP server (handles yt-dlp downloads, streams NDJSON progress)
+- `magpie_ibroadcast.py` — iBroadcast backup module
+- `magpie_tags.py` — Audio tagging from filenames
+
+## STOP — DEPLOY CHANGES YOURSELF
+After editing ANY file in this project, deploy the change. Never ask the user to do it.
+
+- **JS changes (`magpie.user.js`):** Tampermonkey's "Track from disk" is configured to watch
+  `/Applications/Magpie/magpie.user.js`. Edits are live in the browser after a page reload.
+  Bump `@version` in the header on every change. Nothing else needed.
+
+- **Python changes (`magpie_server.py`, `magpie_ibroadcast.py`, `magpie_tags.py`):** Restart
+  the server yourself:
+  ```
+  make -C /Applications/Magpie restart
+  ```
+  Then verify it came back:
+  ```
+  curl -sf http://127.0.0.1:7865/health
+  ```
+
+- **Never say** "restart the server", "reload the script", "bump the version", or any variant.
+  Do it. Report that you did it.
+
+Violation: told user to restart the server and reload Tampermonkey after every single change.
+
+## MEMORY LOCATION
+All memories for this project live in `/Applications/Magpie/.memory/`.
+The index is `/Applications/Magpie/.memory/MEMORY.md`.
+Always read and write memories there — never in the default `~/.claude-work/projects/` path.
 
 ## STOP — FEATURE PARITY
 When adding a new UI element (button, panel, control) that parallels an existing one:

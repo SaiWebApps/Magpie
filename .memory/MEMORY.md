@@ -1,0 +1,3 @@
+- [Development enforcement system](project_dev_skill.md) — Multi-layer defense: CLAUDE.md rules + PreToolUse hooks + PostToolUse hooks + /retro skill
+- [Shell proxy vs localhost](reference_shell-proxy-localhost.md) — can't trust shell-curl streaming tests against 127.0.0.1; verify in browser
+- [No handoffs](feedback_no-handoffs.md) — Deploy changes yourself: bump @version, restart server, verify health. Never ask user.
