@@ -28,6 +28,7 @@ from pathlib import Path
 OAUTH_DEVICE_URL = "https://oauth.ibroadcast.com/device/code"
 OAUTH_TOKEN_URL = "https://oauth.ibroadcast.com/token"
 UPLOAD_URL = "https://upload.ibroadcast.com"
+LIBRARY_URL = "https://library.ibroadcast.com"
 
 # The client id published in iBroadcast's own uploader script. There is no
 # developer registration step; every community uploader uses this value.
@@ -288,6 +289,33 @@ def library_md5s(token):
     if status >= 400:
         raise IBroadcastError(_describe_failure(UPLOAD_URL, status, obj))
     return set(obj.get("md5") or [])
+
+
+def fetch_library(token):
+    """Return the whole library: tracks, albums, artists, playlists, tags, trash.
+
+    Each section except tags is {id: [values...], "map": {field: index}} —
+    see https://help.ibroadcast.com/developer/components/library"""
+    body = json.dumps({
+        "client": UPLOAD_METHOD,
+        "version": "1",
+        "device_name": USER_AGENT,
+        "user_agent": USER_AGENT,
+        "mode": "library",
+    }).encode("utf-8")
+    status, obj = _json_request(
+        LIBRARY_URL, data=body,
+        headers={"Authorization": _auth_header(token),
+                 "User-Agent": USER_AGENT,
+                 "Content-Type": "application/json"})
+    if status >= 400:
+        raise IBroadcastError(_describe_failure(LIBRARY_URL, status, obj))
+    if obj.get("authenticated") is False:
+        raise IBroadcastError(_describe_failure(LIBRARY_URL, 401))
+    if not obj.get("result") or "library" not in obj:
+        raise IBroadcastError(
+            f"library request failed: {_plain_text(obj.get('message') or obj)}")
+    return obj["library"]
 
 
 def load_sent():

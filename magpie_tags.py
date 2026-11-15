@@ -122,9 +122,18 @@ def read_track_number(path, ffprobe):
 
 def set_track_number(path, number, ffmpeg):
     """Write a track number, preserving everything else. True if rewritten."""
+    return set_tags(path, {"track": number}, ffmpeg)
+
+
+def set_tags(path, tags, ffmpeg):
+    """Write the given tags ({"artist": "Aespa", "track": 3, ...}), preserving
+    everything else. True if rewritten.
+
+    Same temp-then-replace stream copy as apply_tags, so a failure never
+    leaves a partial file and the audio is never re-encoded."""
     path = Path(path)
-    tmp = path.with_name(path.name + ".numbering" + path.suffix)
-    meta = ["-metadata", f"track={number}"]
+    tmp = path.with_name(path.name + ".retagging" + path.suffix)
+    meta = [arg for key, value in tags.items() for arg in ("-metadata", f"{key}={value}")]
     for mapping in (["-map", "0", "-c", "copy", "-id3v2_version", "3"],
                     ["-map", "0:a", "-c:a", "copy"]):
         r = _run([ffmpeg, "-v", "error", "-y", "-i", str(path), *mapping, *meta, str(tmp)])
