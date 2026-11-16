@@ -60,6 +60,13 @@ EXPIRY_SKEW_SECONDS = 120
 NETWORK_TIMEOUT = 60
 UPLOAD_TIMEOUT = 600
 
+# After an upload, how long to wait for the track to appear in the library
+# before reporting it missing, and how often to look. iBroadcast accepts a
+# file before processing it, and sometimes never lists it at all; one measured
+# upload took about 100 seconds to appear.
+CONFIRM_TIMEOUT = 15 * 60
+CONFIRM_INTERVAL = 2
+
 
 class IBroadcastError(Exception):
     """Any failure talking to iBroadcast. Never fatal to a stash."""
@@ -319,29 +326,35 @@ def fetch_library(token):
 
 
 def load_sent():
-    """MD5s this machine has already uploaded.
+    """MD5 -> when this machine uploaded it (Unix time).
 
-    iBroadcast accepts an upload before it finishes processing it, and its
-    checksum index only lists processed tracks — so a file sent a minute ago
-    can still be absent from library_md5s(). Trusting that index alone once
-    put 25 duplicates in the library. This local record closes that window."""
+    iBroadcast accepts an upload before it finishes processing it, so a file
+    sent a minute ago can still be absent from the library. Such a file must
+    be waited for, not sent again; the time says whether it is that recent.
+    A plain list without times (the earlier format) loads with time 0."""
     try:
         with open(SENT_PATH) as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return set()
-    return set(data) if isinstance(data, list) else set()
+        return {}
+    if isinstance(data, dict):
+        return {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+    if isinstance(data, list):
+        return {k: 0.0 for k in data if isinstance(k, str)}
+    return {}
 
 
 def record_sent(digests):
-    """Add digests to the local record of what has been uploaded."""
+    """Record digests as uploaded now."""
     if not digests:
         return
-    merged = load_sent() | set(digests)
+    merged = load_sent()
+    now = time.time()
+    merged.update({d: now for d in digests})
     try:
         SENT_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(SENT_PATH, "w") as f:
-            json.dump(sorted(merged), f)
+            json.dump(merged, f, sort_keys=True)
     except OSError:
         pass
 
@@ -369,10 +382,37 @@ def record_uploaded_names(names):
         pass
 
 
-def already_uploaded(token):
-    """Everything known to be in the library: the server's index plus what this
-    machine has sent recently but the server may not have indexed yet."""
-    return library_md5s(token) | load_sent()
+def _listed_tracks(token):
+    """{(title, size)} for every library track not in the trash."""
+    tracks = fetch_library(token).get("tracks", {})
+    # The tracks map also holds nested sub-maps; only integer indexes are
+    # fields of the row itself.
+    fields = {name: index for name, index in tracks.get("map", {}).items()
+              if isinstance(index, int)}
+    listed = set()
+    for key, values in tracks.items():
+        if key == "map":
+            continue
+        row = {name: values[index] for name, index in fields.items() if index < len(values)}
+        if not row.get("trashed"):
+            listed.add(((row.get("title") or "").strip(), row.get("size")))
+    return listed
+
+
+def in_library(files, token):
+    """The paths in files ({path: md5}) that iBroadcast lists in the library.
+
+    A file counts when its MD5 is in the checksum index, or when a library
+    track has its title and exact byte size (iBroadcast's size is the uploaded
+    byte count). The library lists a new upload minutes before the checksum
+    index does, so the index alone would keep the button waiting."""
+    md5s = library_md5s(token)
+    found = {p for p, digest in files.items() if digest in md5s}
+    rest = [p for p in files if p not in found]
+    if rest:
+        listed = _listed_tracks(token)
+        found |= {p for p in rest if (Path(p).stem, Path(p).stat().st_size) in listed}
+    return found
 
 
 def file_md5(path):
@@ -405,21 +445,50 @@ def upload_file(path, token):
     return obj
 
 
+def wait_until_listed(files, token, log=lambda m: None,
+                      progress=lambda phase, done, total: None):
+    """Poll until every file in files ({path: md5}) is listed in the library.
+
+    Returns the paths still missing when CONFIRM_TIMEOUT runs out. A failed
+    poll is logged and retried rather than fatal: a network blip during the
+    wait says nothing about whether the upload landed."""
+    waiting = dict(files)
+    total = len(files)
+    deadline = time.time() + CONFIRM_TIMEOUT
+    while True:
+        try:
+            token = usable_token(log) or token   # a long wait can outlive the token
+            for path in in_library(waiting, token):
+                del waiting[path]
+        except IBroadcastError as exc:
+            log(f"ibroadcast: could not check the library, will retry: {exc}")
+        progress("confirming", total - len(waiting), total)
+        if not waiting or time.time() >= deadline:
+            return list(waiting)
+        time.sleep(CONFIRM_INTERVAL)
+
+
 # ---------------------------------------------------------------------------
 # The entry point the server calls
 # ---------------------------------------------------------------------------
 
-def backup(paths, log=lambda m: None, progress=lambda done, total: None):
-    """Back up finished audio files to iBroadcast.
+def backup(paths, log=lambda m: None, progress=lambda phase, done, total: None):
+    """Back up finished audio files to iBroadcast and confirm they arrived.
 
-    progress(done, total) is called before each file so a caller can report
-    which one is in flight; a playlist upload otherwise looks frozen.
+    progress(phase, done, total) reports "backing_up" before each upload and
+    "confirming" while waiting for the library to list them.
 
     Returns (status, detail) where status is one of:
-      'disabled'   — no token stored; nothing was attempted
-      'uploaded'   — at least one file was sent
-      'skipped'    — everything was already in the library, or none was audio
-      'failed'     — something went wrong; the local files are untouched
+      'confirmed'    — uploaded, and iBroadcast now lists every file
+      'skipped'      — iBroadcast already lists every file, or none was audio
+      'unconfirmed'  — accepted, but not listed after CONFIRM_TIMEOUT
+      'no_login'     — no token stored; nothing was attempted
+      'failed'       — something went wrong; the local files are untouched
+
+    A file counts as already there only if iBroadcast's library lists it.
+    Magpie's own record of what it sent decides just one thing: whether a
+    file not listed yet was sent so recently that it is still processing, in
+    which case it is waited for instead of sent twice.
 
     Never raises: a backup problem must not turn a successful stash into a
     failed one."""
@@ -431,31 +500,39 @@ def backup(paths, log=lambda m: None, progress=lambda done, total: None):
     try:
         token = usable_token(log)
         if token is None:
-            return "disabled", "iBroadcast not set up; run: make ibroadcast-login"
+            return "no_login", ("Not backed up: there is no iBroadcast login. "
+                                "Authorize with:  make ibroadcast-login")
 
-        known = already_uploaded(token)
-        total = len(audio)
-        uploaded = skipped = 0
-        for index, path in enumerate(audio, 1):
-            progress(index, total)
-            digest = file_md5(path)
-            if digest in known:
-                log(f"ibroadcast: already in library, skipping {path.name}")
-                skipped += 1
+        digests = {p: file_md5(p) for p in audio}
+        listed = in_library(digests, token)
+        pending = [p for p in audio if p not in listed]
+        if not pending:
+            log(f"ibroadcast: already in library: {', '.join(p.name for p in audio)}")
+            return "skipped", f"already in library ({len(audio)})"
+
+        sent = load_sent()
+        for index, path in enumerate(pending, 1):
+            progress("backing_up", index, len(pending))
+            if time.time() - sent.get(digests[path], 0) < CONFIRM_TIMEOUT:
+                log(f"ibroadcast: {path.name} was sent minutes ago and is "
+                    "still processing; waiting for it instead of sending it twice")
                 continue
             log(f"ibroadcast: uploading {path.name}")
             upload_file(path, token)
-            # Record before the server can index it, so a repeat run in the
-            # next few minutes does not send it twice.
-            record_sent([digest])
-            known.add(digest)
-            uploaded += 1
+            # Record before the library lists it, so a repeat run in the next
+            # few minutes waits for this copy instead of sending another.
+            record_sent([digests[path]])
+        record_uploaded_names([p.stem for p in pending])
 
-        if uploaded:
-            new_names = [p.stem for p in audio]
-            record_uploaded_names(new_names)
-            return "uploaded", f"{uploaded} uploaded, {skipped} already there"
-        return "skipped", f"already in library ({skipped})"
+        missing = wait_until_listed({p: digests[p] for p in pending}, token, log, progress)
+        if missing:
+            names = ", ".join(p.name for p in missing)
+            return "unconfirmed", (
+                f"iBroadcast accepted {names} but has not listed it after "
+                f"{CONFIRM_TIMEOUT // 60} minutes. It may still be processing, or it "
+                "dropped the file; iBroadcast's Track Dashboard says which.")
+        already = len(audio) - len(pending)
+        return "confirmed", f"{len(pending)} confirmed in library, {already} already there"
     except IBroadcastError as exc:
         log(f"ibroadcast: {exc}")
         return "failed", str(exc)

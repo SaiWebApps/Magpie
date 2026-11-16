@@ -10,9 +10,15 @@ YouTube audio/video stash tool. Two components:
 ## STOP — DEPLOY CHANGES YOURSELF
 After editing ANY file in this project, deploy the change. Never ask the user to do it.
 
-- **JS changes (`magpie.user.js`):** Tampermonkey's "Track from disk" is configured to watch
-  `/Applications/Magpie/magpie.user.js`. Edits are live in the browser after a page reload.
-  Bump `@version` in the header on every change. Nothing else needed.
+- **JS changes (`magpie.user.js`):** In Brave, Tampermonkey runs `magpie-disk.user.js`,
+  a stub whose `@require file:///Applications/Magpie/magpie.user.js` loads the script
+  from disk, so edits are live after a YouTube page reload. Bump `@version` in the
+  header on every change anyway: URL installs (`http://127.0.0.1:7865/magpie.user.js`)
+  only update when it increases.
+  - The stub's header must match `magpie.user.js`'s `@match`/`@grant`/`@connect`/`@run-at`:
+    Tampermonkey ignores the header of a `@require`d file. Change one, change both.
+  - Never claim the browser runs new code without evidence. After the user reloads,
+    the server log (`/tmp/magpie.log`) shows `GET /jobs?url=…` from the page.
 
 - **Python changes (`magpie_server.py`, `magpie_ibroadcast.py`, `magpie_tags.py`):** Restart
   the server yourself:

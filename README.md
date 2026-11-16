@@ -117,22 +117,29 @@ What it does and doesn't do:
   but be aware that removing a track there can remove it from your disk.
 - **Audio only.** MP4 video stashes are never sent; iBroadcast is a music
   service.
-- **Duplicates are skipped.** Magpie compares checksums against your library
-  first, so re-stashing a track you already have uploads nothing.
+- **Duplicates are skipped.** A file counts as already there only when your
+  iBroadcast library lists it (same checksum, or same title and exact size),
+  so re-stashing a track you already have uploads nothing. Magpie's own
+  record of what it sent is not enough on its own: iBroadcast sometimes
+  accepts an upload and never lists it, and that file gets sent again.
 - **A failed upload never fails a stash.** The local file is already saved by
-  then. The button says so, and the reason is in `make logs`.
-- **`backed up` means accepted, not yet playable.** iBroadcast processes
-  uploads on its own schedule — a track took about 100 seconds to appear in a
-  measured run. It will not show up in the app the instant the button says so.
+  then. The button says so, and the reason is one hover away.
+- **✅ means iBroadcast lists the track.** iBroadcast accepts an upload before
+  it processes it — a track took about 100 seconds to appear in a measured
+  run. Magpie waits until your library shows it, checking every 2 seconds,
+  and gives up after 15 minutes with a warning instead of a ✅.
 
-The Stash button shows `Backing up…` during the upload, then one of:
+The Stash button shows `Backing up…` during the upload and `Waiting for
+iBroadcast…` until the library lists it, then one of:
 
-| Message | Meaning |
-|---|---|
-| `Saved to ~/Music · backed up to iBroadcast` | uploaded |
-| `Saved to ~/Music · already in iBroadcast` | you already had it |
-| `Saved to ~/Music · iBroadcast backup failed` | local file is fine, upload isn't |
-| `Saved to ~/Music` | backup is off, or not set up yet |
+| Button | Message | Meaning |
+|---|---|---|
+| ✅ Stashed | `Saved to ~/Music · in iBroadcast` | uploaded, and your library lists it |
+| ✅ Stashed | `Saved to ~/Music · already in iBroadcast` | you already had it |
+| ✅ Stashed | `Saved to ~/Music · iBroadcast backup is off` | you turned backup off |
+| ⚠️ Not in iBroadcast | `Saved to ~/Music · not in iBroadcast yet` | accepted, but not listed after 15 minutes |
+| ⚠️ Backup failed | `Saved to ~/Music · iBroadcast backup failed` | local file is fine, upload isn't |
+| ⚠️ Not backed up | `Saved to ~/Music · not backed up (no iBroadcast login)` | run `make ibroadcast-login` |
 
 ## Track names and tags
 
@@ -155,12 +162,10 @@ since all three share the album `AC`, that information would be gone for good.
 A name with no underscore gets a title only — inventing an album from a single
 word is worse than leaving it unset.
 
-**Track numbers** are rewritten per album, in filename order. A YouTube
-download inherits whatever track number the source carried, which is
-meaningless here — most land on 1, some on 33 — and players order an album by
-that number, so an album stays shuffled however you sort it. After a stash,
-Magpie renumbers only the album it touched, and only the files whose number is
-actually wrong.
+**Track numbers** are left alone. A stash carries no track number, and Magpie
+never rewrites other files to make room for a new one. Sort by title to see an
+album in filename order; an album view that orders by track number lists new
+songs outside that order.
 
 This matters because yt-dlp leaves downloads with no tags at all. Untagged
 files show up in iBroadcast as "Unknown Album" with the filename as the title,
@@ -187,7 +192,8 @@ stash: an untagged file is still a good file.
 ## When something fails
 
 Failures stay on screen. The button holds its failed state — `⚠️ Failed`,
-`⚠️ Backup failed`, `⚠️ Timeout` — until you start another stash, rather than
+`⚠️ Backup failed`, `⚠️ Not in iBroadcast`, `⚠️ Not backed up`, `⚠️ Timeout` —
+until you start another stash, rather than
 resetting itself after a few seconds and taking the reason with it.
 
 **Hover the message to read the error.** Both the button and the line below the
@@ -216,8 +222,8 @@ To turn it off, set this in `~/.config/magpie.json`:
 }
 ```
 
-It's on by default but does nothing until you've run `make ibroadcast-login`,
-so it stays quiet if you never set it up.
+It's on by default. Until you've run `make ibroadcast-login`, each stash says
+`⚠️ Not backed up` so a missing backup never passes for a finished one.
 
 ## Usage
 
@@ -226,6 +232,18 @@ so it stays quiet if you never set it up.
 3. Edit the filename if you want, hit OK
 4. Progress shows on the button (%, Converting, Finishing)
 5. Path appears below the video when done — click to copy
+
+### Leaving the page
+
+A stash keeps going after you leave. Each one is a job the server saves
+before it starts (`~/.config/magpie-jobs.sqlite3`), so closing the tab, moving
+to another video or even restarting the server doesn't stop it. Jobs left
+unfinished when the server stops pick up again when it starts.
+
+Come back to the video and the button shows where the job is — `⌛ 64%`,
+`✅ Stashed` with the saved path, or the failure with its reason on hover.
+Finished jobs are shown this way for 24 hours. The server runs up to three
+jobs at once; any more wait their turn as `⌛ Queued…`.
 
 ## Makefile targets
 
@@ -239,6 +257,7 @@ make restart     Restart the server
 make status      Check if server is running
 make check       Verify dependencies
 make logs        Tail the server log
+make test        Run the server tests (no network; never touches the live server)
 
 make ibroadcast-login    Authorize iBroadcast backup (one time)
 make ibroadcast-status   Check the iBroadcast connection

@@ -3,9 +3,18 @@
 HTTP endpoint that a Tampermonkey userscript can call directly.
 
 Endpoints:
-  GET  /health  — liveness check, returns {"ok": true}
-  GET  /token   — returns the auth token (only from 127.0.0.1)
-  POST /stash   — starts a download, streams progress via SSE
+  GET  /health            — liveness check, returns {"ok": true}
+  GET  /token             — returns the auth token (only from 127.0.0.1)
+  POST /jobs              — queues a download, returns the job at once (202)
+  GET  /jobs?url=<page>   — newest video and playlist job for a YouTube page
+  GET  /jobs/<id>         — one job: state and latest message
+  GET  /jobs/<id>/events  — streams a job's progress as NDJSON until done
+  POST /stash             — queues a download and streams it (pre-queue
+                            interface, kept for older userscripts)
+  POST /check-dupe        — is this name already saved or uploaded?
+
+Downloads run as jobs (magpie_jobs.py), so closing the page that started one
+does not stop it, and jobs unfinished at shutdown resume on the next start.
 
 Auth: Bearer token generated on startup, printed to stdout and written to
 /tmp/magpie-token.
@@ -26,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import urllib.parse
 import urllib.request
 import zipfile
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -33,7 +43,13 @@ from pathlib import Path
 from threading import Lock, Thread
 
 import magpie_ibroadcast
+import magpie_jobs
 import magpie_tags
+
+# The job store and its workers. Created in main(), so importing this module
+# (as the tests do) opens no database and starts no threads.
+JOBS = None
+RUNNER = None
 
 VERSION = "2.0-http"
 
@@ -227,12 +243,18 @@ def ensure_config_file():
 
 
 BACKUP_SUFFIXES = {
-    "uploaded": " · backed up to iBroadcast",
+    "confirmed": " · in iBroadcast",
     "skipped": " · already in iBroadcast",
+    "unconfirmed": " · not in iBroadcast yet",
     "failed": " · iBroadcast backup failed",
-    # "disabled" says nothing: the user has not set it up, so mentioning it on
-    # every single stash would just be noise.
+    "no_login": " · not backed up (no iBroadcast login)",
+    "off": " · iBroadcast backup is off",
 }
+
+# Backup outcomes where the local file is fine but iBroadcast does not have
+# it. The button shows these as a warning, with the detail on hover, instead
+# of a plain ✅ — a check mark means the track is in the library.
+BACKUP_WARNINGS = ("unconfirmed", "failed", "no_login")
 
 
 def tag_downloads(paths, config, ffmpeg, is_audio):
@@ -246,33 +268,21 @@ def tag_downloads(paths, config, ffmpeg, is_audio):
     aliases = config.get("album_aliases")
     magpie_tags.tag_all(paths, ffmpeg, aliases, dlog)
 
-    # Renumber only the albums this stash touched. A YouTube download inherits
-    # a meaningless track number from the source, and players order an album by
-    # that number — so without this the album stays shuffled however it is
-    # sorted. Restricting to the touched albums keeps a one-song stash cheap.
-    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
-    if not os.path.exists(ffprobe):
-        dlog(f"no ffprobe beside {ffmpeg}; leaving track numbers alone")
-        return
-    albums = {magpie_tags.parse_name(Path(p).stem, aliases)[0] for p in paths}
-    albums.discard(None)
-    if albums:
-        magpie_tags.renumber_albums(Path(paths[0]).parent, ffmpeg, ffprobe,
-                                    aliases, albums=albums, log=dlog)
-
 
 def run_backup(paths, enabled, is_audio, send_progress):
-    """Back up finished files to iBroadcast.
+    """Back up finished files to iBroadcast and wait until it lists them.
 
-    Returns (message_suffix, status, detail). The suffix is "" whenever nothing
-    was attempted, so a stash that predates setup reads exactly as it did
-    before this feature existed."""
-    if not enabled or not is_audio:
-        return "", "disabled", ""
+    Returns (message_suffix, status, detail). Video is never sent, so it adds
+    nothing; audio always says where it stands in iBroadcast, including when
+    backup is switched off."""
+    if not is_audio:
+        return "", "video", ""
+    if not enabled:
+        return BACKUP_SUFFIXES["off"], "off", ""
     send_progress({"type": "progress", "phase": "backing_up"})
 
-    def on_progress(done, total):
-        send_progress({"type": "progress", "phase": "backing_up",
+    def on_progress(phase, done, total):
+        send_progress({"type": "progress", "phase": phase,
                        "current": done, "total": total})
 
     status, detail = magpie_ibroadcast.backup(paths, dlog, on_progress)
@@ -281,14 +291,13 @@ def run_backup(paths, enabled, is_audio, send_progress):
 
 
 def attach_backup_error(done, status, detail):
-    """Carry the backup failure reason into the done payload.
+    """Carry a backup warning into the done payload.
 
-    The userscript shows it on hover and keeps the button in a failed state, so
-    the text has to survive the trip rather than only reaching the server log.
-    Success and 'not set up' add nothing."""
-    if status == "failed":
-        done["backup_status"] = "failed"
-        done["backup_error"] = detail or "iBroadcast upload failed"
+    The userscript shows it as a warning with the reason on hover, so the text
+    has to survive the trip rather than only reaching the server log."""
+    if status in BACKUP_WARNINGS:
+        done["backup_status"] = status
+        done["backup_error"] = detail or "iBroadcast does not have this file"
     return done
 
 
@@ -504,12 +513,16 @@ class MagpieHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/health":
+        path = urllib.parse.urlsplit(self.path).path
+        parts = path.strip("/").split("/")
+        if path == "/health":
             self._handle_health()
-        elif self.path == "/token":
+        elif path == "/token":
             self._handle_token()
-        elif self.path.split("?")[0] == "/magpie.user.js":
+        elif path == "/magpie.user.js":
             self._handle_userscript()
+        elif parts[0] == "jobs":
+            self._handle_jobs_get(parts)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -534,7 +547,9 @@ class MagpieHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path == "/stash":
+        if self.path == "/jobs":
+            self._handle_create_job()
+        elif self.path == "/stash":
             self._handle_stash()
         elif self.path == "/check-dupe":
             self._handle_check_dupe()
@@ -592,16 +607,18 @@ class MagpieHandler(BaseHTTPRequestHandler):
 
         self._send_json(200, {"duplicate": len(found_in) > 0, "found_in": found_in, "name": name})
 
-    def _handle_stash(self):
-        """Accept a download request and stream progress via SSE."""
+    def _read_stash_request(self):
+        """Authenticate and validate a stash body, then queue it.
+
+        Returns the new job's id, or None once an error response is sent."""
         if not self._check_auth():
             self._send_json(401, {"error": "unauthorized"})
-            return
+            return None
 
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
             self._send_json(400, {"error": "empty body"})
-            return
+            return None
 
         try:
             raw = self.rfile.read(content_length)
@@ -609,27 +626,70 @@ class MagpieHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             dlog(f"bad request body: {exc}")
             self._send_json(400, {"error": "invalid JSON"})
-            return
+            return None
 
         url = body.get("url")
         name = sanitize(body.get("name", "audio"))
         format = body.get("format", "mp3")
         if format not in ("mp3", "mp4"):
             self._send_json(400, {"error": "format must be mp3 or mp4"})
-            return
-        is_audio = format == "mp3"
-        playlist = body.get("playlist", False)
+            return None
+        playlist = bool(body.get("playlist", False))
 
         if not url:
             self._send_json(400, {"error": "missing url"})
-            return
+            return None
 
         dlog(f"stash request: url={url} name={name} format={format} playlist={playlist}")
+        job_id = JOBS.create(url, name, format, playlist)
+        RUNNER.submit(job_id)
+        dlog(f"job {job_id}: queued")
+        return job_id
 
-        # Begin the streaming response. Chunked transfer encoding lets the
-        # browser hand each NDJSON line to GM_xmlhttpRequest's onprogress as it
-        # arrives instead of buffering the whole body until the socket closes,
-        # and the terminating 0-length chunk gives an explicit end-of-stream.
+    def _handle_create_job(self):
+        """Queue a download and answer straight away. The page then follows
+        the job with GET /jobs/<id>/events, and can drop off at any time."""
+        job_id = self._read_stash_request()
+        if job_id:
+            self._send_json(202, JOBS.get(job_id))
+
+    def _handle_stash(self):
+        """Queue a download, then stream it to the end in the same response.
+        Serves userscripts older than 2.5.0, which stash this way."""
+        job_id = self._read_stash_request()
+        if job_id:
+            self._stream_job(job_id)
+
+    def _handle_jobs_get(self, parts):
+        if not self._check_auth():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        if len(parts) == 1:
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            url = (query.get("url") or [""])[0]
+            if not url:
+                self._send_json(400, {"error": "missing url"})
+                return
+            self._send_json(200, JOBS.newest_for(url))
+            return
+        job = JOBS.get(parts[1])
+        if job is None:
+            self._send_json(404, {"error": "no such job"})
+        elif len(parts) == 2:
+            self._send_json(200, job)
+        elif len(parts) == 3 and parts[2] == "events":
+            self._stream_job(parts[1])
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def _stream_job(self, job_id):
+        """Stream a job's messages as NDJSON until its done message.
+
+        A watcher leaving early only ends the stream; the job carries on."""
+        # Chunked transfer encoding lets the browser hand each NDJSON line to
+        # GM_xmlhttpRequest's onprogress as it arrives instead of buffering the
+        # whole body until the socket closes, and the terminating 0-length
+        # chunk gives an explicit end-of-stream.
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Cache-Control", "no-cache")
@@ -638,305 +698,308 @@ class MagpieHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self._set_cors_headers()
         self.end_headers()
-
-        stream_ended = [False]
-
-        def send_progress(data_dict):
-            if stream_ended[0]:
-                return
-            try:
-                payload = ndjson_line(data_dict).encode("utf-8")
-                # Chunked framing: <hex length> CRLF <payload> CRLF, written as a
-                # single atomic write so concurrent playlist progress updates
-                # (serialized under a lock) can't interleave within a frame.
+        try:
+            for msg in JOBS.follow(job_id):
+                payload = ndjson_line(msg).encode("utf-8")
+                # Chunked framing: <hex length> CRLF <payload> CRLF.
                 self.wfile.write(b"%X\r\n%s\r\n" % (len(payload), payload))
-                # Every _handle_stash code path ends by sending exactly one
-                # {"type": "done"} message; emit the terminating 0-length chunk
-                # right after it so the browser fires onload promptly.
-                if data_dict.get("type") == "done":
-                    self.wfile.write(b"0\r\n\r\n")
-                    stream_ended[0] = True
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError) as exc:
-                stream_ended[0] = True
-                dlog(f"client disconnected during stream: {exc}")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            dlog(f"job {job_id}: watcher left ({exc}); the job carries on")
 
-        # Find yt-dlp
-        yt_dlp = find_yt_dlp()
-        if not yt_dlp:
-            send_progress({"type": "done", "ok": False, "error": "yt-dlp not found. brew install yt-dlp"})
-            return
 
-        # Find a working ffmpeg
-        ffmpeg = None
-        for candidate in FFMPEG_CANDIDATES:
-            if ffmpeg_runs(candidate):
-                ffmpeg = candidate
-                dlog(f"using ffmpeg: {candidate}")
-                break
-            elif os.path.exists(candidate):
-                dlog(f"ffmpeg at {candidate} exists but won't run (likely broken dylibs)")
+# ---------------------------------------------------------------------------
+# The stash itself — run by a job worker, never by a request handler
+# ---------------------------------------------------------------------------
 
-        if not ffmpeg:
-            dlog("no working ffmpeg found; downloading static fallback")
-            send_progress({"type": "progress", "phase": "starting", "percent": 0})
+def run_stash(job, send_progress):
+    """Download, tag and back up one stash, reporting through send_progress.
+
+    job is a magpie_jobs record (url, name, format, playlist). Every path ends
+    by sending exactly one {"type": "done"} message."""
+    url, name, format = job["url"], job["name"], job["format"]
+    is_audio = format == "mp3"
+    playlist = job["playlist"]
+
+    # Find yt-dlp
+    yt_dlp = find_yt_dlp()
+    if not yt_dlp:
+        send_progress({"type": "done", "ok": False, "error": "yt-dlp not found. brew install yt-dlp"})
+        return
+
+    # Find a working ffmpeg
+    ffmpeg = None
+    for candidate in FFMPEG_CANDIDATES:
+        if ffmpeg_runs(candidate):
+            ffmpeg = candidate
+            dlog(f"using ffmpeg: {candidate}")
+            break
+        elif os.path.exists(candidate):
+            dlog(f"ffmpeg at {candidate} exists but won't run (likely broken dylibs)")
+
+    if not ffmpeg:
+        dlog("no working ffmpeg found; downloading static fallback")
+        send_progress({"type": "progress", "phase": "starting", "percent": 0})
+        send_progress({"type": "progress", "phase": "downloading", "percent": 0})
+
+        def _progress(msg):
+            dlog(f"static-install: {msg}")
             send_progress({"type": "progress", "phase": "downloading", "percent": 0})
 
-            def _progress(msg):
-                dlog(f"static-install: {msg}")
-                send_progress({"type": "progress", "phase": "downloading", "percent": 0})
+        installed = download_static_ffmpeg(progress_cb=_progress)
+        if installed:
+            candidate = str(STATIC_BIN_DIR / "ffmpeg")
+            if ffmpeg_runs(candidate):
+                ffmpeg = candidate
+                dlog(f"using static ffmpeg: {candidate}")
 
-            installed = download_static_ffmpeg(progress_cb=_progress)
-            if installed:
-                candidate = str(STATIC_BIN_DIR / "ffmpeg")
-                if ffmpeg_runs(candidate):
-                    ffmpeg = candidate
-                    dlog(f"using static ffmpeg: {candidate}")
+    if not ffmpeg:
+        send_progress({
+            "type": "done",
+            "ok": False,
+            "error": (
+                "ffmpeg not found or all candidates fail to run. "
+                "Try: brew reinstall ffmpeg"
+            ),
+        })
+        return
 
-        if not ffmpeg:
-            send_progress({
-                "type": "done",
-                "ok": False,
-                "error": (
-                    "ffmpeg not found or all candidates fail to run. "
-                    "Try: brew reinstall ffmpeg"
-                ),
-            })
-            return
+    # Prepare output path. Config is read per job, so editing CONFIG_PATH
+    # takes effect on the next stash with no restart.
+    config = load_config()
+    dest_dir = config["audio_dir"] if is_audio else config["video_dir"]
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        key = "audio_dir" if is_audio else "video_dir"
+        send_progress({
+            "type": "done",
+            "ok": False,
+            "error": f"Cannot use destination folder {dest_dir}: {exc}. "
+                     f"Check \"{key}\" in {CONFIG_PATH}.",
+        })
+        return
+    if playlist:
+        download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
+                                   send_progress, config)
+        return
 
-        # Prepare output path. Config is read per request, so editing
-        # CONFIG_PATH takes effect on the next stash with no restart.
-        config = load_config()
-        dest_dir = config["audio_dir"] if is_audio else config["video_dir"]
-        try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            key = "audio_dir" if is_audio else "video_dir"
-            send_progress({
-                "type": "done",
-                "ok": False,
-                "error": f"Cannot use destination folder {dest_dir}: {exc}. "
-                         f"Check \"{key}\" in {CONFIG_PATH}.",
-            })
-            return
-        if playlist:
-            self._download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
-                                             send_progress, config)
-            return
+    output_template = str(dest_dir / f"{name}.%(ext)s")
+    expected_path = str(dest_dir / f"{name}.{format}")
 
-        output_template = str(dest_dir / f"{name}.%(ext)s")
-        expected_path = str(dest_dir / f"{name}.{format}")
+    # Build yt-dlp command through a login shell (resolves dylib paths)
+    if is_audio:
+        format_args = ["-x", "--audio-format", "mp3"]
+    else:
+        format_args = ["--merge-output-format", "mp4"]
+    playlist_args = [] if playlist else ["--no-playlist"]
+    yt_dlp_cmd = " ".join([
+        shlex.quote(yt_dlp),
+        *format_args,
+        *playlist_args,
+        *player_client_args(config["youtube_player_client"]),
+        "--newline",
+        "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
+        "-o", shlex.quote(output_template),
+        shlex.quote(url),
+    ])
+    cmd = ["/bin/zsh", "-l", "-c", yt_dlp_cmd]
+    dlog(f"running shell cmd: {cmd}")
 
-        # Build yt-dlp command through a login shell (resolves dylib paths)
-        if is_audio:
-            format_args = ["-x", "--audio-format", "mp3"]
-        else:
-            format_args = ["--merge-output-format", "mp4"]
-        playlist_args = [] if playlist else ["--no-playlist"]
-        yt_dlp_cmd = " ".join([
-            shlex.quote(yt_dlp),
-            *format_args,
-            *playlist_args,
-            *player_client_args(config["youtube_player_client"]),
-            "--newline",
-            "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
-            "-o", shlex.quote(output_template),
-            shlex.quote(url),
-        ])
-        cmd = ["/bin/zsh", "-l", "-c", yt_dlp_cmd]
-        dlog(f"running shell cmd: {cmd}")
+    send_progress({"type": "progress", "phase": "starting", "percent": 0})
 
-        send_progress({"type": "progress", "phase": "starting", "percent": 0})
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        dlog(f"Popen failed: {e}\n{traceback.format_exc()}")
+        send_progress({"type": "done", "ok": False, "error": f"failed to start yt-dlp: {e}"})
+        return
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except Exception as e:
-            dlog(f"Popen failed: {e}\n{traceback.format_exc()}")
-            send_progress({"type": "done", "ok": False, "error": f"failed to start yt-dlp: {e}"})
-            return
+    last_pct_int = -1
+    tail = []
 
-        last_pct_int = -1
-        tail = []
-
-        if proc.stdout is None:
-            send_progress({"type": "done", "ok": False, "error": "failed to capture yt-dlp output"})
-            proc.wait()
-            return
-
-        for raw in proc.stdout:
-            line = raw.rstrip()
-            if not line:
-                continue
-            tail.append(line)
-            if len(tail) > 80:
-                tail.pop(0)
-            dlog(f"yt-dlp> {line}")
-
-            pm = PLAYLIST_ITEM_RE.match(line)
-            if pm:
-                send_progress({"type": "progress", "phase": "playlist_item", "current": int(pm.group(1)), "total": int(pm.group(2))})
-                last_pct_int = -1
-                continue
-
-            m = PROGRESS_RE.match(line)
-            if m:
-                pct = float(m.group(1))
-                cur_int = int(pct)
-                if cur_int != last_pct_int:
-                    last_pct_int = cur_int
-                    send_progress({"type": "progress", "phase": "downloading", "percent": pct})
-                continue
-
-            lower = line.lower()
-            if "[extractaudio]" in lower or ("destination:" in lower and ".mp3" in lower):
-                send_progress({"type": "progress", "phase": "extracting"})
-            elif "[merger]" in lower or "merging formats" in lower:
-                send_progress({"type": "progress", "phase": "merging"})
-            elif "[fixup" in lower:
-                send_progress({"type": "progress", "phase": "fixing"})
-
+    if proc.stdout is None:
+        send_progress({"type": "done", "ok": False, "error": "failed to capture yt-dlp output"})
         proc.wait()
-        dlog(f"yt-dlp exited with code {proc.returncode}")
+        return
 
-        if proc.returncode == 0:
-            # Playlists return early via _download_playlist_parallel, so this
-            # path is always a single file. Match on the stash name instead of
-            # expected_path: yt-dlp lands on a different extension whenever the
-            # audio conversion is skipped, and that file needs clearing too.
-            produced = [p for p in dest_dir.iterdir()
-                        if p.is_file() and p.name.startswith(name + ".")]
-            for p in produced:
-                strip_quarantine(p)
-            tag_downloads(produced, config, ffmpeg, is_audio)
-            suffix, backup_status, backup_detail = run_backup(
-                produced, config["ibroadcast_upload"], is_audio, send_progress)
-            message = f"Saved to {display_path(dest_dir)}{suffix}"
-            send_progress(attach_backup_error(
-                {"type": "done", "ok": True, "path": expected_path, "message": message},
-                backup_status, backup_detail))
-        else:
-            err_text = "\n".join(tail[-12:]) if tail else f"exit code {proc.returncode}"
-            err_text += f"\n\n[ran: {' '.join(cmd)}]"
-            send_progress({"type": "done", "ok": False, "error": err_text})
+    for raw in proc.stdout:
+        line = raw.rstrip()
+        if not line:
+            continue
+        tail.append(line)
+        if len(tail) > 80:
+            tail.pop(0)
+        dlog(f"yt-dlp> {line}")
 
-    def _download_playlist_parallel(self, url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
-                                    send_progress, config):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        pm = PLAYLIST_ITEM_RE.match(line)
+        if pm:
+            send_progress({"type": "progress", "phase": "playlist_item", "current": int(pm.group(1)), "total": int(pm.group(2))})
+            last_pct_int = -1
+            continue
 
-        player_client = config["youtube_player_client"]
+        m = PROGRESS_RE.match(line)
+        if m:
+            pct = float(m.group(1))
+            cur_int = int(pct)
+            if cur_int != last_pct_int:
+                last_pct_int = cur_int
+                send_progress({"type": "progress", "phase": "downloading", "percent": pct})
+            continue
 
-        send_progress({"type": "progress", "phase": "loading"})
+        lower = line.lower()
+        if "[extractaudio]" in lower or ("destination:" in lower and ".mp3" in lower):
+            send_progress({"type": "progress", "phase": "extracting"})
+        elif "[merger]" in lower or "merging formats" in lower:
+            send_progress({"type": "progress", "phase": "merging"})
+        elif "[fixup" in lower:
+            send_progress({"type": "progress", "phase": "fixing"})
 
-        flat_cmd = ["/bin/zsh", "-l", "-c", " ".join([
-            shlex.quote(yt_dlp),
-            "--flat-playlist", "--dump-json",
-            *player_client_args(player_client),
-            shlex.quote(url),
-        ])]
-        dlog(f"extracting playlist: {flat_cmd}")
+    proc.wait()
+    dlog(f"yt-dlp exited with code {proc.returncode}")
 
-        try:
-            proc = subprocess.run(flat_cmd, capture_output=True, text=True, timeout=120)
-        except Exception as e:
-            send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist: {e}"})
-            return
-
-        if proc.returncode != 0:
-            err = proc.stderr[-500:] if proc.stderr else f"exit code {proc.returncode}"
-            send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist:\n{err}"})
-            return
-
-        items = []
-        for line in proc.stdout.strip().split('\n'):
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-                video_url = entry.get("webpage_url") or entry.get("url", "")
-                if not video_url.startswith("http"):
-                    video_url = f"https://www.youtube.com/watch?v={video_url}"
-                items.append(video_url)
-            except json.JSONDecodeError:
-                continue
-
-        total = len(items)
-        if total == 0:
-            send_progress({"type": "done", "ok": False, "error": "no items found in playlist"})
-            return
-
-        dlog(f"playlist: {total} items, downloading 3 at a time")
-        send_progress({"type": "progress", "phase": "playlist_item", "current": 0, "total": total})
-
-        subfolder = dest_dir / name
-        subfolder.mkdir(parents=True, exist_ok=True)
-        template = str(subfolder / "%(title)s.%(ext)s")
-
-        if is_audio:
-            fmt_args = ["-x", "--audio-format", "mp3"]
-        else:
-            fmt_args = ["--merge-output-format", "mp4"]
-
-        lock = Lock()
-        completed = [0]
-        failed = [0]
-
-        def dl(video_url):
-            yt_cmd = " ".join([
-                shlex.quote(yt_dlp),
-                *fmt_args,
-                "--no-playlist",
-                *player_client_args(player_client),
-                "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
-                "-o", shlex.quote(template),
-                shlex.quote(video_url),
-            ])
-            cmd = ["/bin/zsh", "-l", "-c", yt_cmd]
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                ok = r.returncode == 0
-                if not ok:
-                    dlog(f"playlist item failed: {video_url}: {r.stderr[-200:]}")
-            except Exception as e:
-                dlog(f"playlist item error: {video_url}: {e}")
-                ok = False
-            with lock:
-                if ok:
-                    completed[0] += 1
-                else:
-                    failed[0] += 1
-                done = completed[0] + failed[0]
-                try:
-                    send_progress({"type": "progress", "phase": "playlist_item", "current": done, "total": total})
-                except Exception:
-                    pass
-
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [pool.submit(dl, v) for v in items]
-            for f in as_completed(futures):
-                pass
-
-        produced = [p for p in subfolder.iterdir() if p.is_file()]
+    if proc.returncode == 0:
+        # Playlists return early via download_playlist_parallel, so this path
+        # is always a single file. Match on the stash name instead of
+        # expected_path: yt-dlp lands on a different extension whenever the
+        # audio conversion is skipped, and that file needs clearing too.
+        produced = [p for p in dest_dir.iterdir()
+                    if p.is_file() and p.name.startswith(name + ".")]
         for p in produced:
             strip_quarantine(p)
         tag_downloads(produced, config, ffmpeg, is_audio)
-
-        dest_label = display_path(subfolder)
-        if failed[0] == 0:
-            msg = f"Stashed {total} tracks to {dest_label}"
-        else:
-            msg = f"Stashed {completed[0]}/{total} to {dest_label} ({failed[0]} failed)"
         suffix, backup_status, backup_detail = run_backup(
             produced, config["ibroadcast_upload"], is_audio, send_progress)
+        message = f"Saved to {display_path(dest_dir)}{suffix}"
         send_progress(attach_backup_error(
-            {"type": "done", "ok": failed[0] == 0 or completed[0] > 0,
-             "path": str(subfolder), "message": msg + suffix},
+            {"type": "done", "ok": True, "path": expected_path, "message": message},
             backup_status, backup_detail))
+    else:
+        err_text = "\n".join(tail[-12:]) if tail else f"exit code {proc.returncode}"
+        err_text += f"\n\n[ran: {' '.join(cmd)}]"
+        send_progress({"type": "done", "ok": False, "error": err_text})
+
+
+def download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
+                               send_progress, config):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    player_client = config["youtube_player_client"]
+
+    send_progress({"type": "progress", "phase": "loading"})
+
+    flat_cmd = ["/bin/zsh", "-l", "-c", " ".join([
+        shlex.quote(yt_dlp),
+        "--flat-playlist", "--dump-json",
+        *player_client_args(player_client),
+        shlex.quote(url),
+    ])]
+    dlog(f"extracting playlist: {flat_cmd}")
+
+    try:
+        proc = subprocess.run(flat_cmd, capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist: {e}"})
+        return
+
+    if proc.returncode != 0:
+        err = proc.stderr[-500:] if proc.stderr else f"exit code {proc.returncode}"
+        send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist:\n{err}"})
+        return
+
+    items = []
+    for line in proc.stdout.strip().split('\n'):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+            video_url = entry.get("webpage_url") or entry.get("url", "")
+            if not video_url.startswith("http"):
+                video_url = f"https://www.youtube.com/watch?v={video_url}"
+            items.append(video_url)
+        except json.JSONDecodeError:
+            continue
+
+    total = len(items)
+    if total == 0:
+        send_progress({"type": "done", "ok": False, "error": "no items found in playlist"})
+        return
+
+    dlog(f"playlist: {total} items, downloading 3 at a time")
+    send_progress({"type": "progress", "phase": "playlist_item", "current": 0, "total": total})
+
+    subfolder = dest_dir / name
+    subfolder.mkdir(parents=True, exist_ok=True)
+    template = str(subfolder / "%(title)s.%(ext)s")
+
+    if is_audio:
+        fmt_args = ["-x", "--audio-format", "mp3"]
+    else:
+        fmt_args = ["--merge-output-format", "mp4"]
+
+    lock = Lock()
+    completed = [0]
+    failed = [0]
+
+    def dl(video_url):
+        yt_cmd = " ".join([
+            shlex.quote(yt_dlp),
+            *fmt_args,
+            "--no-playlist",
+            *player_client_args(player_client),
+            "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
+            "-o", shlex.quote(template),
+            shlex.quote(video_url),
+        ])
+        cmd = ["/bin/zsh", "-l", "-c", yt_cmd]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            ok = r.returncode == 0
+            if not ok:
+                dlog(f"playlist item failed: {video_url}: {r.stderr[-200:]}")
+        except Exception as e:
+            dlog(f"playlist item error: {video_url}: {e}")
+            ok = False
+        with lock:
+            if ok:
+                completed[0] += 1
+            else:
+                failed[0] += 1
+            done = completed[0] + failed[0]
+            try:
+                send_progress({"type": "progress", "phase": "playlist_item", "current": done, "total": total})
+            except Exception:
+                pass
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(dl, v) for v in items]
+        for f in as_completed(futures):
+            pass
+
+    produced = [p for p in subfolder.iterdir() if p.is_file()]
+    for p in produced:
+        strip_quarantine(p)
+    tag_downloads(produced, config, ffmpeg, is_audio)
+
+    dest_label = display_path(subfolder)
+    if failed[0] == 0:
+        msg = f"Stashed {total} tracks to {dest_label}"
+    else:
+        msg = f"Stashed {completed[0]}/{total} to {dest_label} ({failed[0]} failed)"
+    suffix, backup_status, backup_detail = run_backup(
+        produced, config["ibroadcast_upload"], is_audio, send_progress)
+    send_progress(attach_backup_error(
+        {"type": "done", "ok": failed[0] == 0 or completed[0] > 0,
+         "path": str(subfolder), "message": msg + suffix},
+        backup_status, backup_detail))
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1044,16 @@ def main():
     # Print token to stdout so the LaunchAgent can capture it
     print(f"MAGPIE_TOKEN={AUTH_TOKEN}", flush=True)
     dlog(f"auth token: {AUTH_TOKEN}")
+
+    global JOBS, RUNNER
+    JOBS = magpie_jobs.JobStore()
+    RUNNER = magpie_jobs.JobRunner(JOBS, run_stash, dlog)
+    dlog(f"jobs: {magpie_jobs.DB_PATH}")
+    resumed = JOBS.requeue_unfinished()
+    for job_id in resumed:
+        RUNNER.submit(job_id)
+    if resumed:
+        dlog(f"resuming {len(resumed)} job(s) left unfinished by the last run: {resumed}")
 
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), MagpieHandler)
     dlog(f"listening on http://{LISTEN_HOST}:{LISTEN_PORT}")

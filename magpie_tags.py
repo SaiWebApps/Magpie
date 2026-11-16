@@ -96,35 +96,6 @@ def tag_all(paths, ffmpeg, aliases=None, log=lambda m: None):
     return sum(1 for p in paths if apply_tags(p, ffmpeg, aliases, log))
 
 
-# ---------------------------------------------------------------------------
-# Track numbers
-# ---------------------------------------------------------------------------
-#
-# A YouTube download inherits whatever "track" value the source happened to
-# carry, which is meaningless here — most land on 1, some on 33. Players order
-# an album by that number, so an album ends up shuffled no matter how it is
-# sorted. Numbering each album by title makes (album, track) order the same as
-# (album, title) in any player.
-
-
-def read_track_number(path, ffprobe):
-    """Current track number as an int, or None if unset or unreadable."""
-    r = subprocess.run(
-        [ffprobe, "-v", "error", "-show_entries", "format_tags=track",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        capture_output=True, text=True, timeout=60)
-    raw = r.stdout.strip().split("/")[0]     # "3/12" -> "3"
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-def set_track_number(path, number, ffmpeg):
-    """Write a track number, preserving everything else. True if rewritten."""
-    return set_tags(path, {"track": number}, ffmpeg)
-
-
 def set_tags(path, tags, ffmpeg):
     """Write the given tags ({"artist": "Aespa", "track": 3, ...}), preserving
     everything else. True if rewritten.
@@ -143,41 +114,3 @@ def set_tags(path, tags, ffmpeg):
         tmp.unlink(missing_ok=True)
     return False
 
-
-def renumber_albums(directory, ffmpeg, ffprobe, aliases=None, albums=None,
-                    log=lambda m: None):
-    """Number every album's tracks by title order, 1..N.
-
-    Only files whose number is already wrong are rewritten, so adding one track
-    to a large album touches a handful of files rather than all of them.
-
-    albums: restrict to these album names; None means every album present.
-    Returns (files_rewritten, albums_touched)."""
-    directory = Path(directory)
-    grouped = {}
-    for path in sorted(directory.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in TAGGABLE_SUFFIXES:
-            continue
-        album, title = parse_name(path.stem, aliases)
-        if album is None:
-            continue                  # no album, nothing to order within
-        if albums is not None and album not in albums:
-            continue
-        grouped.setdefault(album, []).append((title, path))
-
-    rewritten, touched = 0, 0
-    for album, entries in sorted(grouped.items()):
-        entries.sort(key=lambda pair: pair[0].lower())
-        changed_here = 0
-        for index, (title, path) in enumerate(entries, 1):
-            if read_track_number(path, ffprobe) == index:
-                continue
-            if set_track_number(path, index, ffmpeg):
-                rewritten += 1
-                changed_here += 1
-            else:
-                log(f"could not set track number on {path.name}")
-        if changed_here:
-            touched += 1
-            log(f"renumbered {album}: {changed_here} of {len(entries)} files")
-    return rewritten, touched

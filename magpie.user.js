@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Magpie
 // @namespace    com.magpie.stash
-// @version      2.4.0
+// @version      2.7.1
 // @description  One-click YouTube audio/video stash via local server
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -78,7 +78,7 @@
 
   function showStashed(message, opts = {}) {
     const el = ensureStatusEl();
-    el.innerHTML = '';
+    el.replaceChildren();
     el.title = '';
     el._error = '';
     el.style.cursor = '';
@@ -229,9 +229,18 @@
     hideErrorTip();
   }
 
+  // Backup outcomes that keep the button out of ✅: the file saved locally,
+  // but iBroadcast does not have it. The server sends the reason with each.
+  const BACKUP_WARNINGS = {
+    unconfirmed: '⚠️ Not in iBroadcast',
+    failed: '⚠️ Backup failed',
+    no_login: '⚠️ Not backed up'
+  };
+
   function progressLabel(msg) {
     const phase = msg.phase;
     const pct = msg.percent;
+    if (phase === 'queued') return '⌛ Queued…';
     if (phase === 'starting') return '⌛ Starting…';
     if (phase === 'loading') return '⌛ Loading…';
     if (phase === 'downloading' && typeof pct === 'number') {
@@ -241,32 +250,6 @@
     if (phase === 'merging') return '⌛ Merging…';
     if (phase === 'fixing') return '⌛ Finishing…';
     return '⌛ Stashing…';
-  }
-
-  // ---- NDJSON stream parser -------------------------------------------------
-
-  function parseNdjsonChunk(responseText, lastParsedLength) {
-    const newText = responseText.slice(lastParsedLength);
-    const lines = newText.split('\n');
-    const messages = [];
-
-    let consumedLength = lastParsedLength;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (i === lines.length - 1 && !newText.endsWith('\n')) {
-        break;
-      }
-      consumedLength += line.length + 1;
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        messages.push(JSON.parse(trimmed));
-      } catch (e) {
-        LOG('failed to parse NDJSON line:', trimmed, e);
-      }
-    }
-
-    return { messages, consumedLength };
   }
 
   // ---- Stash via local HTTP server ------------------------------------------
@@ -298,7 +281,11 @@
     });
   }
 
-  function stashViaServer(btn, url, name, format, playlist) {
+  // A stash is a job on the server. Creating it returns at once; the button
+  // then follows the job's progress. Leaving the page only stops the
+  // following, never the download, and the next page load picks it back up
+  // (see reattach).
+  function stashViaServer(btn, url, name, format, playlist, retried) {
     clearFailure(btn);
     setLabel(btn, '⌛ Starting…', { disabled: true, color: '#3f3f3f' });
     LOG('sending stash request to local server', { url, name });
@@ -314,112 +301,336 @@
         return;
       }
 
-      let parsedUpTo = 0;
-      let finished = false;
-      let playlistInfo = '';
-
-      function handleMsg(msg) {
-        if (msg.type === 'progress') {
-          if (msg.phase === 'playlist_item') {
-            playlistInfo = msg.current + '/' + msg.total + ' — ';
-            setLabel(btn, '⌛ ' + msg.current + '/' + msg.total, { disabled: true, color: '#3f3f3f' });
-          } else if (msg.phase === 'backing_up') {
-            // Downloading has finished by this point, so drop the "12/12 — "
-            // download prefix instead of stacking two counters on the button.
-            playlistInfo = '';
-            const many = typeof msg.current === 'number' && msg.total > 1;
-            const count = many ? ' ' + msg.current + '/' + msg.total : '';
-            setLabel(btn, '⌛ Backing up' + count + '…', { disabled: true, color: '#3f3f3f' });
-          } else {
-            const label = progressLabel(msg);
-            if (playlistInfo) {
-              setLabel(btn, '⌛ ' + playlistInfo + label.replace(/^⌛ /, ''), { disabled: true, color: '#3f3f3f' });
-            } else {
-              setLabel(btn, label, { disabled: true, color: '#3f3f3f' });
-            }
-          }
-        } else if (msg.type === 'done') {
-          finished = true;
-          if (msg.ok && msg.backup_status === 'failed') {
-            // The local file saved fine — only the iBroadcast copy failed, so
-            // this stays a warning about the backup, not about the stash.
-            LOG('saved, but backup failed:', msg.path);
-            setFailure(btn, '⚠️ Backup failed', msg.backup_error);
-            showStashed(msg.message, { failed: true, detail: msg.backup_error });
-          } else if (msg.ok) {
-            LOG('saved:', msg.path);
-            setLabel(btn, '✅ Stashed', { color: '#2a6a2a' });
-            showStashed(msg.message);
-          } else {
-            LOG('server error:', msg.error);
-            setFailure(btn, '⚠️ Failed', msg.error);
-            showStashed('Stash failed', { failed: true, detail: msg.error });
-          }
-        }
-      }
-
       GM_xmlhttpRequest({
         method: 'POST',
-        url: SERVER + '/stash',
+        url: SERVER + '/jobs',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ' + token
         },
         data: JSON.stringify({ url: url, name: name, format: format, playlist: !!playlist }),
-        responseType: 'text',
+        onload: function (response) {
+          // A restarted server has a new token; fetch it and try once more.
+          if (response.status === 401 && !retried) {
+            cachedToken = null;
+            stashViaServer(btn, url, name, format, playlist, true);
+            return;
+          }
+          let job = null;
+          try { job = JSON.parse(response.responseText); } catch (e) {}
+          if (response.status !== 202 || !job || !job.id) {
+            const why = 'Server returned HTTP ' + response.status +
+                        '\n\n' + (response.responseText || '(no body)');
+            LOG('could not create job:', why);
+            setFailure(btn, '⚠️ Failed', why);
+            showStashed('Stash failed', { failed: true, detail: why });
+            return;
+          }
+          LOG('job created:', job.id);
+          watchJob(btn, job.id, playlist);
+        },
+        onerror: function (response) {
+          const why = 'Could not reach ' + SERVER + '\n' +
+                      (response && response.statusText ? response.statusText : 'connection failed') +
+                      '\n\nCheck it with:   make status';
+          LOG('request error:', why);
+          setFailure(btn, '⚠️ Error', why);
+          showStashed('Stash failed', { failed: true, detail: why });
+        }
+      });
+    });
+  }
 
-      onprogress: function (response) {
-        if (finished) return;
-        const result = parseNdjsonChunk(response.responseText, parsedUpTo);
-        parsedUpTo = result.consumedLength;
-        for (const msg of result.messages) handleMsg(msg);
-      },
+  function stopWatching(btn) {
+    if (btn && btn._watch) {
+      btn._watch.abort();
+      btn._watch = null;
+    }
+  }
 
-      onload: function (response) {
-        if (!finished) {
-          const result = parseNdjsonChunk(response.responseText, parsedUpTo);
-          for (const msg of result.messages) handleMsg(msg);
-          if (!finished) {
-            if (response.status >= 200 && response.status < 300) {
-              LOG('stream ended without explicit done message');
-              const why = 'The server closed the connection without reporting a ' +
-                          'result.\nThe file may or may not have saved.' +
-                          '\n\nCheck with:   make logs';
-              setFailure(btn, '⚠️ Unknown', why, '#7a5a2a');
-              showStashed('Stash result unknown', { failed: true, detail: why });
-            } else {
-              LOG('server returned status', response.status);
-              const why = 'Server returned HTTP ' + response.status +
-                          '\n\n' + (response.responseText || '(no body)');
-              setFailure(btn, '⚠️ Failed', why);
-              showStashed('Stash failed', { failed: true, detail: why });
-            }
+  // Follow one job's progress on btn until its done message. A job that has
+  // already finished answers with just that message, so this also restores
+  // the result of a stash started on an earlier visit.
+  //
+  // The server pushes each message as it happens (GET /jobs/<id>/events), read
+  // here through Tampermonkey's stream response. Tampermonkey's ordinary text
+  // response arrives only when the request completes, which for a progress feed
+  // means at the very end, so stream mode is required. If the stream cannot be
+  // read, delivers nothing within STREAM_FIRST_MESSAGE_MS (the server sends the
+  // job's current state immediately), or ends before the job does, the button
+  // falls back to asking for the job every POLL_MS.
+  const STREAM_FIRST_MESSAGE_MS = 3000;
+  const POLL_MS = 1000;
+  // Consecutive failed polls before giving up. A server restart takes a few
+  // seconds, and the job resumes after it, so a short outage is not a failure.
+  const POLL_FAILURES_ALLOWED = 15;
+
+  function watchJob(btn, jobId, playlist) {
+    stopWatching(btn);
+    // Long enough for the download plus up to 15 minutes waiting for
+    // iBroadcast to list the upload.
+    const limitMs = playlist ? 7200000 : 1800000;
+    const startedAt = Date.now();
+    const watch = {
+      stopped: false,
+      timer: null,
+      request: null,
+      abort: function () {
+        this.stopped = true;
+        clearTimeout(this.timer);
+        if (this.request) this.request.abort();
+      }
+    };
+    btn._watch = watch;
+
+    let lastSeen = '';
+    let failures = 0;
+    let playlistInfo = '';
+
+    function handleMsg(msg) {
+      if (msg.type === 'progress') {
+        if (msg.phase === 'playlist_item') {
+          playlistInfo = msg.current + '/' + msg.total + ' — ';
+          setLabel(btn, '⌛ ' + msg.current + '/' + msg.total, { disabled: true, color: '#3f3f3f' });
+        } else if (msg.phase === 'backing_up' || msg.phase === 'confirming') {
+          // Downloading has finished by this point, so drop the "12/12 — "
+          // download prefix instead of stacking two counters on the button.
+          playlistInfo = '';
+          const many = typeof msg.current === 'number' && msg.total > 1;
+          const count = many ? ' ' + msg.current + '/' + msg.total : '';
+          const what = msg.phase === 'confirming' ? '⌛ Waiting for iBroadcast' : '⌛ Backing up';
+          setLabel(btn, what + count + '…', { disabled: true, color: '#3f3f3f' });
+        } else {
+          const label = progressLabel(msg);
+          if (playlistInfo) {
+            setLabel(btn, '⌛ ' + playlistInfo + label.replace(/^⌛ /, ''), { disabled: true, color: '#3f3f3f' });
+          } else {
+            setLabel(btn, label, { disabled: true, color: '#3f3f3f' });
           }
         }
-      },
+      } else if (msg.type === 'done') {
+        const warning = msg.ok && BACKUP_WARNINGS[msg.backup_status];
+        if (warning) {
+          // The local file saved fine, but iBroadcast does not have it, so
+          // this is a warning about the backup rather than a ✅.
+          LOG('saved, but not in iBroadcast:', msg.path, msg.backup_status);
+          setFailure(btn, warning, msg.backup_error);
+          showStashed(msg.message, { failed: true, detail: msg.backup_error });
+        } else if (msg.ok) {
+          LOG('saved:', msg.path);
+          setLabel(btn, '✅ Stashed', { color: '#2a6a2a' });
+          showStashed(msg.message);
+        } else {
+          LOG('server error:', msg.error);
+          setFailure(btn, '⚠️ Failed', msg.error);
+          showStashed('Stash failed', { failed: true, detail: msg.error });
+        }
+      }
+    }
 
-      onerror: function (response) {
-        if (finished) return;
-        const why = 'Could not reach ' + SERVER + '\n' +
-                    (response && response.statusText ? response.statusText : 'connection failed') +
-                    '\n\nCheck it with:   make status';
-        LOG('request error:', why);
-        setFailure(btn, '⚠️ Error', why);
-        showStashed('Stash failed', { failed: true, detail: why });
-      },
+    // Both the stream and the polls feed this. The same message can arrive
+    // from both around a switch, so repeats are dropped.
+    function deliver(msg) {
+      const seen = JSON.stringify(msg);
+      if (seen !== lastSeen) {
+        lastSeen = seen;
+        handleMsg(msg);
+      }
+      if (msg.type === 'done') stop();
+    }
 
-      ontimeout: function () {
-        if (finished) return;
-        const limit = playlist ? '60 minutes' : '10 minutes';
-        const why = 'The server did not finish within ' + limit + '.' +
-                    '\n\nCheck what it was doing:   make logs';
-        LOG('request timed out');
-        setFailure(btn, '⚠️ Timeout', why);
-        showStashed('Stash timed out', { failed: true, detail: why });
-      },
+    function stop() {
+      watch.stopped = true;
+      clearTimeout(watch.timer);
+      if (btn._watch === watch) btn._watch = null;
+    }
 
-      timeout: playlist ? 3600000 : 600000
-    });
+    function fail(text, why) {
+      stop();
+      LOG('stopped following job', jobId + ':', why);
+      setFailure(btn, text, why);
+      showStashed('Stash status unknown', { failed: true, detail: why });
+    }
+
+    function timedOut() {
+      return Date.now() - startedAt > limitMs;
+    }
+
+    function failTimeout() {
+      fail('⚠️ Timeout', 'The server did not finish within ' +
+           (playlist ? '2 hours' : '30 minutes') + '.' +
+           '\nIt keeps working on it: reload this page to check again.' +
+           '\n\nCheck what it was doing:   make logs');
+    }
+
+    // ---- push: read the server's NDJSON event stream as it arrives ----
+
+    function streamJob() {
+      if (watch.stopped) return;
+      fetchToken(function (token) {
+        if (watch.stopped) return;
+        if (!token) {
+          pollJob('no token for the stream');
+          return;
+        }
+        let switched = false;
+        function fallBack(reason) {
+          if (switched || watch.stopped) return;
+          switched = true;
+          clearTimeout(watch.timer);
+          if (watch.request) watch.request.abort();
+          pollJob(reason);
+        }
+        watch.timer = setTimeout(function () {
+          fallBack('no stream message within ' + STREAM_FIRST_MESSAGE_MS + ' ms');
+        }, STREAM_FIRST_MESSAGE_MS);
+
+        watch.request = GM_xmlhttpRequest({
+          method: 'GET',
+          url: SERVER + '/jobs/' + encodeURIComponent(jobId) + '/events',
+          headers: { 'Authorization': 'Bearer ' + token },
+          responseType: 'stream',
+          timeout: limitMs,
+          onloadstart: async function (response) {
+            const stream = response && response.response;
+            if (!stream || typeof stream.getReader !== 'function') {
+              fallBack('stream responses are not available');
+              return;
+            }
+            const reader = stream.getReader();
+            const decoder = new TextDecoder();
+            let buffered = '';
+            try {
+              while (!watch.stopped && !switched) {
+                const chunk = await reader.read();
+                if (chunk.done) break;
+                buffered += decoder.decode(chunk.value, { stream: true });
+                // NDJSON: one JSON message per line.
+                let end = buffered.indexOf('\n');
+                while (end !== -1) {
+                  const line = buffered.slice(0, end).trim();
+                  buffered = buffered.slice(end + 1);
+                  if (line) {
+                    clearTimeout(watch.timer);
+                    // A failure to draw a message is not a failure of the
+                    // stream, so it must not switch the button to polling.
+                    try {
+                      deliver(JSON.parse(line));
+                    } catch (e) {
+                      LOG('could not show job message:', line, e);
+                    }
+                  }
+                  end = buffered.indexOf('\n');
+                }
+              }
+            } catch (e) {
+              fallBack('stream read failed: ' + e);
+              return;
+            }
+            if (!watch.stopped) fallBack('stream ended before the job did');
+          },
+          onerror: function () {
+            fallBack('stream request failed');
+          },
+          ontimeout: function () {
+            if (!watch.stopped) failTimeout();
+          }
+        });
+      });
+    }
+
+    // ---- fallback: ask for the job once a second ----
+
+    function pollJob(reason) {
+      if (watch.stopped) return;
+      LOG('following job', jobId, 'by polling:', reason);
+      poll();
+    }
+
+    function next() {
+      if (watch.stopped) return;
+      if (timedOut()) {
+        failTimeout();
+        return;
+      }
+      watch.timer = setTimeout(poll, POLL_MS);
+    }
+
+    function lostContact(detail) {
+      failures += 1;
+      if (failures < POLL_FAILURES_ALLOWED) {
+        next();
+        return;
+      }
+      fail('⚠️ Error', 'Lost contact with ' + SERVER + '\n' + detail +
+           '\n\nThe stash keeps going if the server is running:' +
+           '\nreload this page to see it.' +
+           '\n\nCheck it with:   make status');
+    }
+
+    function poll() {
+      if (watch.stopped) return;
+      fetchToken(function (token) {
+        if (watch.stopped) return;
+        if (!token) {
+          lostContact('no token (is the server running?)');
+          return;
+        }
+        watch.request = GM_xmlhttpRequest({
+          method: 'GET',
+          url: SERVER + '/jobs/' + encodeURIComponent(jobId),
+          headers: { 'Authorization': 'Bearer ' + token },
+          onload: function (response) {
+            if (watch.stopped) return;
+            // A restarted server has a new token; fetch it on the next poll.
+            if (response.status === 401) {
+              cachedToken = null;
+              lostContact('server restarted');
+              return;
+            }
+            let job = null;
+            try { job = JSON.parse(response.responseText); } catch (e) {}
+            if (response.status !== 200 || !job || !job.message) {
+              fail('⚠️ Failed', 'Server returned HTTP ' + response.status +
+                   '\n\n' + (response.responseText || '(no body)'));
+              return;
+            }
+            failures = 0;
+            deliver(job.message);
+            next();
+          },
+          onerror: function (response) {
+            if (watch.stopped) return;
+            lostContact(response && response.statusText ? response.statusText : 'connection failed');
+          }
+        });
+      });
+    }
+
+    LOG('following job', jobId, 'by stream');
+    streamJob();
+  }
+
+  // On page load, show the newest stash of this video (kind 'video') or this
+  // playlist (kind 'playlist') if it is still running or finished recently.
+  // Silent when there is none, or the server is down: nothing was asked yet.
+  function reattach(btn, kind) {
+    fetchToken(function (token) {
+      if (!token) return;
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: SERVER + '/jobs?url=' + encodeURIComponent(location.href),
+        headers: { 'Authorization': 'Bearer ' + token },
+        onload: function (response) {
+          if (response.status !== 200 || !btn.isConnected) return;
+          let found = null;
+          try { found = JSON.parse(response.responseText); } catch (e) { return; }
+          const job = found && found[kind];
+          if (!job) return;
+          LOG('reattaching', kind, 'button to job', job.id, '(' + job.state + ')');
+          watchJob(btn, job.id, job.playlist);
+        }
+      });
     });
   }
 
@@ -532,9 +743,15 @@
 
     var msg = document.createElement('div');
     msg.style.cssText = 'color:rgba(255,255,255,0.7);margin-bottom:20px;word-break:break-word;';
-    msg.innerHTML = '<b style="color:rgba(255,255,255,0.9)">' +
-      name.replace(/</g, '&lt;') + '</b> already exists in <b style="color:rgba(255,255,255,0.9)">' +
-      where + '</b>.';
+    function bold(text) {
+      var b = document.createElement('b');
+      b.style.color = 'rgba(255,255,255,0.9)';
+      b.textContent = text;
+      return b;
+    }
+    // Built from nodes rather than innerHTML: YouTube enforces Trusted Types,
+    // which rejects every innerHTML assignment made by a script.
+    msg.append(bold(name), ' already exists in ', bold(where), '.');
 
     var btnRow = document.createElement('div');
     btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;';
@@ -878,6 +1095,7 @@
         controls.appendChild(btn);
       }
       LOG('playlist button injected into controls');
+      reattach(btn, 'playlist');
       return;
     }
 
@@ -886,6 +1104,7 @@
       const btn = buildPlaylistButton();
       header.appendChild(btn);
       LOG('playlist button injected into header');
+      reattach(btn, 'playlist');
     }
   }
 
@@ -959,12 +1178,12 @@
     if (!location.pathname.startsWith('/watch')) return;
 
     if (lastInjectedUrl !== null && location.href !== lastInjectedUrl) {
-      document.querySelectorAll('.' + CLASS).forEach((b) => b.remove());
+      document.querySelectorAll('.' + CLASS).forEach((b) => { stopWatching(b); b.remove(); });
       const stale = document.getElementById(STATUS_ID);
       if (stale) stale.remove();
       const popover = document.getElementById('magpie-format-popover');
       if (popover) popover.remove();
-      document.querySelectorAll('.' + PLAYLIST_CLASS).forEach((b) => b.remove());
+      document.querySelectorAll('.' + PLAYLIST_CLASS).forEach((b) => { stopWatching(b); b.remove(); });
       hideErrorTip();
     }
 
@@ -994,9 +1213,13 @@
         btn.style.visibility = 'visible';
         LOG('button visible at', Math.round(r.x) + ',' + Math.round(r.y),
             Math.round(r.width) + 'x' + Math.round(r.height));
+        // Only a button that stays gets reattached, so a clipped attempt
+        // that is about to be removed never opens a stream.
+        reattach(btn, 'video');
         return;
       }
       LOG('button clipped via', strategy.label, '— removing, will retry');
+      stopWatching(btn);
       btn.remove();
     }); });
   }

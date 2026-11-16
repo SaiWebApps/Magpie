@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Stand-in for yt-dlp in Magpie's tests.
+
+Prints the progress lines the real yt-dlp prints and writes an output file,
+without touching the network. MAGPIE_FAKE_DELAY sets the pause between
+progress lines. A video id of "fail" exits non-zero like a real failure.
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.parse
+
+args = sys.argv[1:]
+delay = float(os.environ.get("MAGPIE_FAKE_DELAY", "0.05"))
+url = args[-1]
+
+if "--flat-playlist" in args:
+    for n in range(1, 4):
+        print(json.dumps({"url": f"item{n}", "title": f"Item {n}"}))
+    sys.exit(0)
+
+video = (urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("v") or ["video"])[0]
+if video == "fail":
+    print("ERROR: [youtube] fail: Video unavailable", flush=True)
+    sys.exit(1)
+
+ext = "mp3" if "-x" in args else "mp4"
+out = args[args.index("-o") + 1].replace("%(title)s", video).replace("%(ext)s", ext)
+
+print(f"[youtube] Extracting URL: {url}", flush=True)
+for pct in range(0, 101, 10):
+    print(f"[download] {pct:5.1f}% of 1.00MiB at 1.00MiB/s ETA 00:01", flush=True)
+    time.sleep(delay)
+if ext == "mp3":
+    print(f"[ExtractAudio] Destination: {out}", flush=True)
+with open(out, "wb") as f:
+    f.write(f"fake audio for {out}".encode("utf-8"))

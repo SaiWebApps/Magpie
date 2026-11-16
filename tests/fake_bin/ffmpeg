@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in for ffmpeg in Magpie's tests: answers the server's "-version"
+# health check. Tagging is turned off in the test config, so nothing else
+# calls it.
+exit 0

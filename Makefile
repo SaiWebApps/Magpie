@@ -6,7 +6,7 @@ PLIST_DEST  := $(PLIST_DIR)/$(PLIST_NAME)
 LOG         := /tmp/magpie-server.log
 
 .PHONY: install uninstall reinstall start stop restart status check logs help \
-        ibroadcast-login ibroadcast-status
+        ibroadcast-login ibroadcast-status test
 
 help: ## Show available targets
 	@grep -E '^[a-z].*:.*##' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | column -t -s '	'
@@ -82,6 +82,9 @@ status: ## Check if server is running
 
 logs: ## Tail the server log
 	@tail -f "$(LOG)"
+
+test: ## Run the server tests (no network; never touches the live server)
+	@python3 -m unittest discover -s "$(CURDIR)/tests" -v
 
 ibroadcast-login: ## Authorize iBroadcast backup (one time, opens a code prompt)
 	@python3 -u "$(CURDIR)/magpie_ibroadcast.py" login
