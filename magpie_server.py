@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Magpie HTTP server — replaces the native messaging host with an SSE-based
-HTTP endpoint that a Tampermonkey userscript can call directly.
+"""Magpie HTTP server — the local endpoint the Tampermonkey userscript calls.
 
 Endpoints:
   GET  /health            — liveness check, returns {"ok": true}
@@ -9,42 +8,45 @@ Endpoints:
   GET  /jobs?url=<page>   — newest video and playlist job for a YouTube page
   GET  /jobs/<id>         — one job: state and latest message
   GET  /jobs/<id>/events  — streams a job's progress as NDJSON until done
-  POST /stash             — queues a download and streams it (pre-queue
-                            interface, kept for older userscripts)
+  POST /stash             — queues a download and streams it (for userscripts
+                            older than 2.5.0)
   POST /check-dupe        — is this name already saved or uploaded?
 
 Downloads run as jobs (magpie_jobs.py), so closing the page that started one
 does not stop it, and jobs unfinished at shutdown resume on the next start.
 
-Auth: Bearer token generated on startup, printed to stdout and written to
-/tmp/magpie-token.
+yt-dlp, ffmpeg, ffprobe and deno are Magpie's own pinned copies
+(magpie_tools.py), run directly with no shell. yt-dlp reports progress and
+the files it wrote as JSON lines, read with json rather than parsed as text.
 
-Save locations live in ~/.config/magpie.json ("audio_dir" / "video_dir"),
-written with defaults on first run and re-read on every stash.
+Files live where magpie_paths.py says for this OS: config.json (save folders
+and options, re-read on every stash), the job database, the iBroadcast
+token, and the log, magpie.log.
 
-Debug log lives at /tmp/magpie.log — tail it to see what's happening.
+Auth: a Bearer token generated on startup, printed to stdout and written to
+the server-token file in the state folder.
 """
 
 import datetime
 import json
 import os
-import re
 import secrets
 import shlex
+import socket
+import socketserver
 import subprocess
 import sys
-import tempfile
 import traceback
 import urllib.parse
-import urllib.request
-import zipfile
-from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock
 
 import magpie_ibroadcast
 import magpie_jobs
+import magpie_paths
 import magpie_tags
+import magpie_tools
 
 # The job store and its workers. Created in main(), so importing this module
 # (as the tests do) opens no database and starts no threads.
@@ -54,74 +56,73 @@ RUNNER = None
 VERSION = "2.0-http"
 
 HOME = Path.home()
+DIRS = magpie_paths.DIRS
 
-# Served at /magpie.user.js so Tampermonkey can update itself from disk. Without
-# it the copy running in the browser is a hand-paste that silently drifts from
-# this repo the moment either one changes.
+# Served at /magpie.user.js so Tampermonkey can install and update the script
+# from this checkout.
 SCRIPT_DIR = Path(__file__).resolve().parent
 USERSCRIPT_PATH = SCRIPT_DIR / "magpie.user.js"
 
-# Destination folders. These are the fallbacks; load_config() lets a JSON file
-# at CONFIG_PATH override either one without touching this file.
-CONFIG_PATH = Path(os.environ.get("MAGPIE_CONFIG") or HOME / ".config" / "magpie.json")
-DEFAULT_AUDIO_DIR = HOME / "Music"
-DEFAULT_VIDEO_DIR = HOME / "Movies"
+# Destination folders. These are the fallbacks; load_config() lets the JSON
+# file at CONFIG_PATH override either one without touching this file.
+CONFIG_PATH = DIRS.config_file
+DEFAULT_AUDIO_DIR = DIRS.music()
+DEFAULT_VIDEO_DIR = DIRS.videos()
 
-# Back up stashed audio to iBroadcast. On by default, but a no-op until the
-# user has authorized: magpie_ibroadcast.backup() reports "disabled" when no
-# token is stored, and the stash carries on regardless.
+# Back up stashed audio to iBroadcast. On by default; with no login stored,
+# each stash says it was not backed up and carries on.
 DEFAULT_IBROADCAST_UPLOAD = True
 
-# YouTube 403s the audio stream for most yt-dlp player clients. web_embedded is
-# what currently gets served; "default" trails it so yt-dlp can still fall back.
-# YouTube changes this often — override youtube_player_client in the config
-# rather than editing here, and check `yt-dlp --extractor-args help` for names.
-DEFAULT_YT_PLAYER_CLIENT = "web_embedded,default"
+# Empty means yt-dlp chooses YouTube's player clients itself, which tracks
+# YouTube's changes better than any fixed list here. Set youtube_player_client
+# in the config to force one (see `yt-dlp --extractor-args help`).
+DEFAULT_YT_PLAYER_CLIENT = ""
 
 # Write album/title tags from the {Album}_{Track} filename before uploading.
-# yt-dlp leaves downloads untagged, and iBroadcast then falls back to the
-# filename — which is how the library filled up with "Unknown Album".
+# yt-dlp leaves downloads untagged, and iBroadcast then files them under
+# "Unknown Album" with the filename as the title.
 DEFAULT_TAG_FROM_FILENAME = True
 DEFAULT_ALBUM_ALIASES = magpie_tags.DEFAULT_ALBUM_ALIASES
 
-YT_DLP_CANDIDATES = [
-    "/opt/homebrew/bin/yt-dlp",
-    "/usr/local/bin/yt-dlp",
-    "/usr/bin/yt-dlp",
-]
-
-STATIC_BIN_DIR = HOME / "Library" / "Application Support" / "Magpie" / "bin"
-
-FFMPEG_CANDIDATES = [
-    str(STATIC_BIN_DIR / "ffmpeg"),
-    "/opt/homebrew/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-    "/usr/bin/ffmpeg",
-]
-
-LOG_PATH = "/tmp/magpie.log"
-TOKEN_PATH = "/tmp/magpie-token"
+LOG_PATH = DIRS.log_file
+TOKEN_PATH = DIRS.server_token
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 7865
 
-EVERMEET_FFMPEG = "https://evermeet.cx/ffmpeg/getrelease/zip"
-EVERMEET_FFPROBE = "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip"
-
 ALLOWED_ORIGINS = {"https://www.youtube.com", "https://youtube.com"}
-
-PROGRESS_RE = re.compile(r"^\[download\]\s+(\d+(?:\.\d+)?)%")
-PLAYLIST_ITEM_RE = re.compile(r"^\[download\]\s+Downloading item (\d+) of (\d+)")
 
 AUTH_TOKEN = secrets.token_urlsafe(32)
 
+# yt-dlp is told to print each event as one JSON object per line: download
+# progress, postprocessor progress, and the final path of every file it wrote.
+DOWNLOAD_TEMPLATE = 'download:{"kind": "download", "progress": %(progress)j}'
+POSTPROCESS_TEMPLATE = 'postprocess:{"kind": "postprocess", "progress": %(progress)j}'
+FILE_TEMPLATE = 'after_move:{"kind": "file", "path": %(filepath)j}'
+
+# yt-dlp postprocessor names -> the phase the button shows while it runs.
+POSTPROCESS_PHASES = {
+    "ExtractAudio": "extracting",
+    "Merger": "merging",
+    "FixupM4a": "fixing",
+    "FixupM3u8": "fixing",
+    "FixupTimestamp": "fixing",
+    "FixupDuration": "fixing",
+    "FixupDuplicateMoov": "fixing",
+    "FixupStretched": "fixing",
+}
+
+# Longest stash name and playlist-item filename, in characters. Leaves room
+# for the folders above them inside Windows' 260-character path limit.
+MAX_NAME = 150
+
 
 # ---------------------------------------------------------------------------
-# Utility functions reused from magpie_stash.py
+# Logging and configuration
 # ---------------------------------------------------------------------------
 
 def dlog(msg):
     try:
-        with open(LOG_PATH, "a") as f:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}\n")
     except Exception as exc:
         sys.stderr.write(f"dlog failed: {exc}\n")
@@ -130,7 +131,7 @@ def dlog(msg):
 def display_path(p: Path) -> str:
     """Render a path with the home folder collapsed to ~ for display."""
     try:
-        return "~/" + str(p.relative_to(HOME))
+        return os.path.join("~", str(p.relative_to(HOME)))
     except ValueError:
         return str(p)
 
@@ -139,8 +140,8 @@ def _coerce_dir(value, default: Path) -> Path:
     """Turn one config value into an absolute Path, falling back to default.
 
     A relative path is rejected rather than resolved, because the server's
-    working directory is whatever launchd handed it — not something the user
-    can reason about when editing the config."""
+    working directory is whatever started it — not something the user can
+    reason about when editing the config."""
     if not isinstance(value, str) or not value.strip():
         return default
     p = Path(value.strip()).expanduser()
@@ -181,15 +182,16 @@ def _config_defaults():
 
 
 def player_client_args(client):
-    """yt-dlp flags selecting the YouTube player client, or none if disabled."""
-    if not client or client.lower() in ("", "default", "none", "auto"):
+    """yt-dlp flags selecting the YouTube player client, or none to let
+    yt-dlp choose."""
+    if not client or client.lower() in ("default", "none", "auto"):
         return []
-    return ["--extractor-args", shlex.quote(f"youtube:player_client={client}")]
+    return ["--extractor-args", f"youtube:player_client={client}"]
 
 
 def load_config():
     """Return the settings dict: audio_dir and video_dir as Paths, plus the
-    ibroadcast_upload flag.
+    other options.
 
     Called on every stash so an edit takes effect on the next download without
     a server restart. A missing, unreadable, or malformed file falls back to
@@ -198,9 +200,9 @@ def load_config():
     if not CONFIG_PATH.exists():
         return defaults
     try:
-        with open(CONFIG_PATH) as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         dlog(f"config: cannot read {CONFIG_PATH} ({exc}); using defaults")
         return defaults
     if not isinstance(data, dict):
@@ -227,7 +229,7 @@ def ensure_config_file():
         return
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_PATH, "w") as f:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump({
                 "audio_dir": str(DEFAULT_AUDIO_DIR),
                 "video_dir": str(DEFAULT_VIDEO_DIR),
@@ -241,6 +243,10 @@ def ensure_config_file():
     except OSError as exc:
         dlog(f"could not write default config to {CONFIG_PATH}: {exc}")
 
+
+# ---------------------------------------------------------------------------
+# Tagging and backup
+# ---------------------------------------------------------------------------
 
 BACKUP_SUFFIXES = {
     "confirmed": " · in iBroadcast",
@@ -301,19 +307,28 @@ def attach_backup_error(done, status, detail):
     return done
 
 
+# ---------------------------------------------------------------------------
+# File names
+# ---------------------------------------------------------------------------
+
 MEDIA_SUFFIXES = (".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus",
                   ".mp4", ".mkv", ".webm", ".mov")
 
+# Names Windows reserves for devices, with or without an extension.
+WINDOWS_RESERVED = ({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                    | {f"COM{d}" for d in "123456789¹²³"}
+                    | {f"LPT{d}" for d in "123456789¹²³"})
+
 
 def sanitize(name: str) -> str:
-    """Clean a user-supplied filename.
+    """Clean a user-supplied filename into one that is valid on macOS,
+    Windows and Linux alike, so a library can move between them.
 
     A trailing media extension is dropped. yt-dlp appends the real extension
     itself, so "Song.mp3" typed at the prompt would otherwise be saved as
-    "Song.mp3.m4a" — a name that lies about the contents, which is what broke
-    the Music app import and left junk titles in the iBroadcast library."""
+    "Song.mp3.m4a" — a name that lies about the contents."""
     bad = '/\\:*?"<>|'
-    cleaned = "".join(c for c in name if c not in bad).strip()
+    cleaned = "".join(c for c in name if c not in bad and ord(c) >= 32).strip()
     # Repeat: "Song.mp3.m4a" must not become "Song.mp3" and then "Song.mp3.mp3".
     # Each pass removes at least one character, so this always terminates.
     stripping = True
@@ -325,52 +340,25 @@ def sanitize(name: str) -> str:
                 cleaned = cleaned[:-len(suffix)].strip()
                 stripping = True
                 break
+    # Windows drops trailing dots and spaces, and refuses device names.
+    cleaned = cleaned[:MAX_NAME].rstrip(". ")
+    if cleaned.split(".")[0].rstrip(" ").upper() in WINDOWS_RESERVED:
+        cleaned = "_" + cleaned
     return cleaned or "audio"
-
-
-def _find(candidates, binary):
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    from shutil import which
-    return which(binary)
-
-
-def find_yt_dlp():
-    return _find(YT_DLP_CANDIDATES, "yt-dlp")
-
-
-def find_ffmpeg():
-    return _find(FFMPEG_CANDIDATES, "ffmpeg")
-
-
-def strip_xattrs(path):
-    """Remove all extended attributes from path, especially com.apple.quarantine."""
-    try:
-        for attr in os.listxattr(path):
-            try:
-                os.removexattr(path, attr)
-            except OSError as exc:
-                dlog(f"removexattr {attr} on {path}: {exc}")
-    except (OSError, AttributeError) as exc:
-        dlog(f"listxattr on {path}: {exc}")
-    try:
-        subprocess.run(["/usr/bin/xattr", "-c", path], check=False, timeout=5)
-    except Exception as exc:
-        dlog(f"xattr -c on {path}: {exc}")
 
 
 QUARANTINE_ATTR = "com.apple.quarantine"
 
 
 def strip_quarantine(path):
-    """Clear the Gatekeeper quarantine flag from a finished download.
+    """On macOS, clear the Gatekeeper quarantine flag from a finished download.
 
-    macOS attributes a download to the browser that triggered it, and Music.app
-    refuses to open media still carrying the flag. Unlike strip_xattrs() this
-    removes only that one attribute, so Finder tags on files already sitting in
-    the destination folder survive. xattr(1) is used because os.removexattr is
-    absent from macOS Python builds."""
+    macOS can attribute a download to the browser that triggered it, and
+    Music.app refuses to open media still carrying the flag. Only that one
+    attribute is removed, so Finder tags survive. Other systems have no such
+    flag."""
+    if sys.platform != "darwin":
+        return
     try:
         # Returns non-zero when the attribute is not set; that is not an error.
         subprocess.run(
@@ -381,68 +369,97 @@ def strip_quarantine(path):
         dlog(f"could not clear quarantine on {path}: {exc}")
 
 
-def ffmpeg_runs(path):
-    """Returns True iff path actually executes successfully (all dylibs resolve
-    and Gatekeeper allows it)."""
-    if not path or not os.path.exists(path):
-        return False
-    try:
-        if str(STATIC_BIN_DIR) in path:
-            strip_xattrs(path)
-    except Exception as exc:
-        dlog(f"strip_xattrs during ffmpeg_runs: {exc}")
-    try:
-        r = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=8)
-        return r.returncode == 0
-    except Exception as exc:
-        dlog(f"ffmpeg_runs check failed for {path}: {exc}")
-        return False
+# ---------------------------------------------------------------------------
+# The bundled tools
+# ---------------------------------------------------------------------------
+
+_TOOLS_LOCK = Lock()
 
 
-def download_static_ffmpeg(progress_cb=None):
-    """Download evermeet.cx static ffmpeg + ffprobe into STATIC_BIN_DIR.
-    Returns the directory on success, or None on failure."""
-    STATIC_BIN_DIR.mkdir(parents=True, exist_ok=True)
-    targets = [
-        ("ffmpeg", EVERMEET_FFMPEG),
-        ("ffprobe", EVERMEET_FFPROBE),
-    ]
-    for name, url in targets:
-        out = STATIC_BIN_DIR / name
-        if out.exists() and ffmpeg_runs(str(out)):
+def get_tools(send_progress):
+    """{"yt-dlp": argv prefix, "ffmpeg": path, "ffprobe": path, "deno": path},
+    installing any missing tool first. Raises magpie_tools.ToolError."""
+    with _TOOLS_LOCK:
+        if magpie_tools.missing():
+            def on_progress(tool, n, total):
+                send_progress({"type": "progress", "phase": "installing",
+                               "current": n, "total": total})
+            magpie_tools.install(log=dlog, progress=on_progress)
+    paths = magpie_tools.tool_paths()
+    return {"yt-dlp": [str(paths["yt-dlp"])], "ffmpeg": str(paths["ffmpeg"]),
+            "ffprobe": str(paths["ffprobe"]), "deno": str(paths["deno"])}
+
+
+def popen_kwargs():
+    """Text pipes in UTF-8 on every OS, and no console window on Windows."""
+    kwargs = {"encoding": "utf-8", "errors": "replace"}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return kwargs
+
+
+def yt_dlp_base(tools, config):
+    """The arguments every yt-dlp call shares: no config file or self-update
+    can change behaviour, and the bundled deno and ffmpeg are the ones used."""
+    return [*tools["yt-dlp"], "--ignore-config", "--no-update",
+            "--no-js-runtimes", "--js-runtimes", f"deno:{tools['deno']}",
+            "--ffmpeg-location", tools["ffmpeg"],
+            *player_client_args(config["youtube_player_client"])]
+
+
+def download_argv(tools, config, url, output_template, is_audio, extra=()):
+    format_args = ["-x", "--audio-format", "mp3"] if is_audio else ["--merge-output-format", "mp4"]
+    return [*yt_dlp_base(tools, config),
+            "--newline", "--progress",
+            "--progress-template", DOWNLOAD_TEMPLATE,
+            "--progress-template", POSTPROCESS_TEMPLATE,
+            "--print", FILE_TEMPLATE,
+            *format_args, "--no-playlist", *extra,
+            "-o", output_template, "--", url]
+
+
+def run_download(argv, on_progress):
+    """Run one yt-dlp download, passing its progress to on_progress.
+
+    Returns (exit code, [paths yt-dlp wrote], [last non-JSON output lines])."""
+    dlog(f"running: {argv}")
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            bufsize=1, **popen_kwargs())
+    files, tail = [], []
+    last_percent = -1
+    for raw in proc.stdout:
+        line = raw.rstrip("\r\n")
+        if not line:
             continue
-        if progress_cb:
-            progress_cb(f"downloading {name}")
-        dlog(f"downloading static {name} from {url}")
         try:
-            with urllib.request.urlopen(url, timeout=120) as resp:
-                data = resp.read()
-            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-                tmp.write(data)
-                zip_path = tmp.name
-            extracted = False
-            with zipfile.ZipFile(zip_path) as z:
-                for member in z.namelist():
-                    base = os.path.basename(member)
-                    if base == name:
-                        with z.open(member) as src, open(out, "wb") as dst:
-                            dst.write(src.read())
-                        out.chmod(0o755)
-                        strip_xattrs(str(out))
-                        extracted = True
-                        break
-            os.unlink(zip_path)
-            if not extracted:
-                dlog(f"zip didn't contain {name}")
-                return None
-            dlog(f"installed static {name} at {out} (quarantine stripped)")
-        except Exception as e:
-            dlog(f"failed to fetch {name}: {e}\n{traceback.format_exc()}")
-            return None
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if not isinstance(event, dict) or "kind" not in event:
+            tail.append(line)
+            del tail[:-80]
+            dlog(f"yt-dlp> {line}")
+            continue
+        progress = event.get("progress") or {}
+        if event["kind"] == "file" and event.get("path"):
+            files.append(Path(event["path"]))
+        elif event["kind"] == "download" and progress.get("status") == "downloading":
+            percent = progress.get("_percent")
+            if isinstance(percent, (int, float)) and int(percent) != last_percent:
+                last_percent = int(percent)
+                on_progress({"type": "progress", "phase": "downloading", "percent": percent})
+        elif event["kind"] == "postprocess" and progress.get("status") == "started":
+            phase = POSTPROCESS_PHASES.get(progress.get("postprocessor"))
+            if phase:
+                on_progress({"type": "progress", "phase": phase})
+    proc.wait()
+    dlog(f"yt-dlp exited with code {proc.returncode}; wrote {[str(f) for f in files]}")
+    return proc.returncode, files, tail
 
-    if all((STATIC_BIN_DIR / n).exists() for n, _ in targets):
-        return str(STATIC_BIN_DIR)
-    return None
+
+def describe_failure(code, tail, argv):
+    text = "\n".join(tail[-12:]) if tail else f"exit code {code}"
+    return text + f"\n\n[ran: {shlex.join(argv)}]"
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +476,7 @@ def ndjson_line(data_dict):
 # ---------------------------------------------------------------------------
 
 class MagpieHandler(BaseHTTPRequestHandler):
-    """Handles /health, /token, and /stash endpoints."""
+    """Handles /health, /token, /jobs, /stash and /check-dupe."""
 
     server_version = f"Magpie/{VERSION}"
     # HTTP/1.1 so /stash can stream with chunked transfer encoding (the browser
@@ -706,8 +723,23 @@ class MagpieHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError) as exc:
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
             dlog(f"job {job_id}: watcher left ({exc}); the job carries on")
+
+
+class MagpieHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse DNS lookup http.server does
+    while binding, which can stall for about 35 seconds on macOS 15 and later.
+    On Windows the port is bound exclusively: SO_REUSEADDR there lets another
+    process bind the same port and steal requests."""
+
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self):
+        if sys.platform == "win32":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 # ---------------------------------------------------------------------------
@@ -721,53 +753,18 @@ def run_stash(job, send_progress):
     by sending exactly one {"type": "done"} message."""
     url, name, format = job["url"], job["name"], job["format"]
     is_audio = format == "mp3"
-    playlist = job["playlist"]
 
-    # Find yt-dlp
-    yt_dlp = find_yt_dlp()
-    if not yt_dlp:
-        send_progress({"type": "done", "ok": False, "error": "yt-dlp not found. brew install yt-dlp"})
+    send_progress({"type": "progress", "phase": "starting", "percent": 0})
+    try:
+        tools = get_tools(send_progress)
+    except (magpie_tools.ToolError, OSError) as exc:
+        dlog(f"tools unavailable: {exc}\n{traceback.format_exc()}")
+        send_progress({"type": "done", "ok": False,
+                       "error": f"Magpie could not set up yt-dlp and ffmpeg: {exc}"})
         return
 
-    # Find a working ffmpeg
-    ffmpeg = None
-    for candidate in FFMPEG_CANDIDATES:
-        if ffmpeg_runs(candidate):
-            ffmpeg = candidate
-            dlog(f"using ffmpeg: {candidate}")
-            break
-        elif os.path.exists(candidate):
-            dlog(f"ffmpeg at {candidate} exists but won't run (likely broken dylibs)")
-
-    if not ffmpeg:
-        dlog("no working ffmpeg found; downloading static fallback")
-        send_progress({"type": "progress", "phase": "starting", "percent": 0})
-        send_progress({"type": "progress", "phase": "downloading", "percent": 0})
-
-        def _progress(msg):
-            dlog(f"static-install: {msg}")
-            send_progress({"type": "progress", "phase": "downloading", "percent": 0})
-
-        installed = download_static_ffmpeg(progress_cb=_progress)
-        if installed:
-            candidate = str(STATIC_BIN_DIR / "ffmpeg")
-            if ffmpeg_runs(candidate):
-                ffmpeg = candidate
-                dlog(f"using static ffmpeg: {candidate}")
-
-    if not ffmpeg:
-        send_progress({
-            "type": "done",
-            "ok": False,
-            "error": (
-                "ffmpeg not found or all candidates fail to run. "
-                "Try: brew reinstall ffmpeg"
-            ),
-        })
-        return
-
-    # Prepare output path. Config is read per job, so editing CONFIG_PATH
-    # takes effect on the next stash with no restart.
+    # Config is read per job, so editing CONFIG_PATH takes effect on the next
+    # stash with no restart.
     config = load_config()
     dest_dir = config["audio_dir"] if is_audio else config["video_dir"]
     try:
@@ -781,152 +778,66 @@ def run_stash(job, send_progress):
                      f"Check \"{key}\" in {CONFIG_PATH}.",
         })
         return
-    if playlist:
-        download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
-                                   send_progress, config)
+    if job["playlist"]:
+        download_playlist_parallel(url, name, is_audio, dest_dir, tools, send_progress, config)
         return
 
-    output_template = str(dest_dir / f"{name}.%(ext)s")
-    expected_path = str(dest_dir / f"{name}.{format}")
-
-    # Build yt-dlp command through a login shell (resolves dylib paths)
-    if is_audio:
-        format_args = ["-x", "--audio-format", "mp3"]
-    else:
-        format_args = ["--merge-output-format", "mp4"]
-    playlist_args = [] if playlist else ["--no-playlist"]
-    yt_dlp_cmd = " ".join([
-        shlex.quote(yt_dlp),
-        *format_args,
-        *playlist_args,
-        *player_client_args(config["youtube_player_client"]),
-        "--newline",
-        "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
-        "-o", shlex.quote(output_template),
-        shlex.quote(url),
-    ])
-    cmd = ["/bin/zsh", "-l", "-c", yt_dlp_cmd]
-    dlog(f"running shell cmd: {cmd}")
-
-    send_progress({"type": "progress", "phase": "starting", "percent": 0})
-
+    argv = download_argv(tools, config, url, str(dest_dir / f"{name}.%(ext)s"), is_audio)
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-    except Exception as e:
-        dlog(f"Popen failed: {e}\n{traceback.format_exc()}")
-        send_progress({"type": "done", "ok": False, "error": f"failed to start yt-dlp: {e}"})
+        code, produced, tail = run_download(argv, send_progress)
+    except OSError as exc:
+        dlog(f"could not start yt-dlp: {exc}\n{traceback.format_exc()}")
+        send_progress({"type": "done", "ok": False, "error": f"failed to start yt-dlp: {exc}"})
         return
 
-    last_pct_int = -1
-    tail = []
-
-    if proc.stdout is None:
-        send_progress({"type": "done", "ok": False, "error": "failed to capture yt-dlp output"})
-        proc.wait()
+    if code != 0:
+        send_progress({"type": "done", "ok": False, "error": describe_failure(code, tail, argv)})
         return
-
-    for raw in proc.stdout:
-        line = raw.rstrip()
-        if not line:
-            continue
-        tail.append(line)
-        if len(tail) > 80:
-            tail.pop(0)
-        dlog(f"yt-dlp> {line}")
-
-        pm = PLAYLIST_ITEM_RE.match(line)
-        if pm:
-            send_progress({"type": "progress", "phase": "playlist_item", "current": int(pm.group(1)), "total": int(pm.group(2))})
-            last_pct_int = -1
-            continue
-
-        m = PROGRESS_RE.match(line)
-        if m:
-            pct = float(m.group(1))
-            cur_int = int(pct)
-            if cur_int != last_pct_int:
-                last_pct_int = cur_int
-                send_progress({"type": "progress", "phase": "downloading", "percent": pct})
-            continue
-
-        lower = line.lower()
-        if "[extractaudio]" in lower or ("destination:" in lower and ".mp3" in lower):
-            send_progress({"type": "progress", "phase": "extracting"})
-        elif "[merger]" in lower or "merging formats" in lower:
-            send_progress({"type": "progress", "phase": "merging"})
-        elif "[fixup" in lower:
-            send_progress({"type": "progress", "phase": "fixing"})
-
-    proc.wait()
-    dlog(f"yt-dlp exited with code {proc.returncode}")
-
-    if proc.returncode == 0:
-        # Playlists return early via download_playlist_parallel, so this path
-        # is always a single file. Match on the stash name instead of
-        # expected_path: yt-dlp lands on a different extension whenever the
-        # audio conversion is skipped, and that file needs clearing too.
-        produced = [p for p in dest_dir.iterdir()
-                    if p.is_file() and p.name.startswith(name + ".")]
-        for p in produced:
-            strip_quarantine(p)
-        tag_downloads(produced, config, ffmpeg, is_audio)
-        suffix, backup_status, backup_detail = run_backup(
-            produced, config["ibroadcast_upload"], is_audio, send_progress)
-        message = f"Saved to {display_path(dest_dir)}{suffix}"
-        send_progress(attach_backup_error(
-            {"type": "done", "ok": True, "path": expected_path, "message": message},
-            backup_status, backup_detail))
-    else:
-        err_text = "\n".join(tail[-12:]) if tail else f"exit code {proc.returncode}"
-        err_text += f"\n\n[ran: {' '.join(cmd)}]"
-        send_progress({"type": "done", "ok": False, "error": err_text})
+    for p in produced:
+        strip_quarantine(p)
+    tag_downloads(produced, config, tools["ffmpeg"], is_audio)
+    suffix, backup_status, backup_detail = run_backup(
+        produced, config["ibroadcast_upload"], is_audio, send_progress)
+    path = str(produced[-1]) if produced else str(dest_dir / f"{name}.{format}")
+    send_progress(attach_backup_error(
+        {"type": "done", "ok": True, "path": path,
+         "message": f"Saved to {display_path(dest_dir)}{suffix}"},
+        backup_status, backup_detail))
 
 
-def download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
-                               send_progress, config):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    player_client = config["youtube_player_client"]
-
-    send_progress({"type": "progress", "phase": "loading"})
-
-    flat_cmd = ["/bin/zsh", "-l", "-c", " ".join([
-        shlex.quote(yt_dlp),
-        "--flat-playlist", "--dump-json",
-        *player_client_args(player_client),
-        shlex.quote(url),
-    ])]
-    dlog(f"extracting playlist: {flat_cmd}")
-
-    try:
-        proc = subprocess.run(flat_cmd, capture_output=True, text=True, timeout=120)
-    except Exception as e:
-        send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist: {e}"})
-        return
-
+def playlist_entries(tools, config, url):
+    """The video URLs in a playlist, in order. Raises RuntimeError with
+    yt-dlp's message when the playlist cannot be read."""
+    argv = [*yt_dlp_base(tools, config), "--flat-playlist", "--dump-json", "--", url]
+    dlog(f"extracting playlist: {argv}")
+    proc = subprocess.run(argv, capture_output=True, timeout=120, **popen_kwargs())
     if proc.returncode != 0:
-        err = proc.stderr[-500:] if proc.stderr else f"exit code {proc.returncode}"
-        send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist:\n{err}"})
-        return
-
+        raise RuntimeError(proc.stderr[-500:] if proc.stderr else f"exit code {proc.returncode}")
     items = []
-    for line in proc.stdout.strip().split('\n'):
-        if not line.strip():
-            continue
+    for line in proc.stdout.splitlines():
         try:
             entry = json.loads(line)
-            video_url = entry.get("webpage_url") or entry.get("url", "")
-            if not video_url.startswith("http"):
-                video_url = f"https://www.youtube.com/watch?v={video_url}"
-            items.append(video_url)
-        except json.JSONDecodeError:
+        except ValueError:
             continue
+        if not isinstance(entry, dict):
+            continue
+        video_url = entry.get("webpage_url") or entry.get("url") or ""
+        if urllib.parse.urlsplit(video_url).scheme not in ("http", "https"):
+            video_url = "https://www.youtube.com/watch?" + urllib.parse.urlencode(
+                {"v": entry.get("id") or video_url})
+        items.append(video_url)
+    return items
+
+
+def download_playlist_parallel(url, name, is_audio, dest_dir, tools, send_progress, config):
+    from concurrent.futures import ThreadPoolExecutor
+
+    send_progress({"type": "progress", "phase": "loading"})
+    try:
+        items = playlist_entries(tools, config, url)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        send_progress({"type": "done", "ok": False, "error": f"failed to extract playlist:\n{exc}"})
+        return
 
     total = len(items)
     if total == 0:
@@ -940,54 +851,37 @@ def download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
     subfolder.mkdir(parents=True, exist_ok=True)
     template = str(subfolder / "%(title)s.%(ext)s")
 
-    if is_audio:
-        fmt_args = ["-x", "--audio-format", "mp3"]
-    else:
-        fmt_args = ["--merge-output-format", "mp4"]
-
     lock = Lock()
     completed = [0]
     failed = [0]
+    produced = []
 
     def dl(video_url):
-        yt_cmd = " ".join([
-            shlex.quote(yt_dlp),
-            *fmt_args,
-            "--no-playlist",
-            *player_client_args(player_client),
-            "--ffmpeg-location", shlex.quote(os.path.dirname(ffmpeg)),
-            "-o", shlex.quote(template),
-            shlex.quote(video_url),
-        ])
-        cmd = ["/bin/zsh", "-l", "-c", yt_cmd]
+        argv = download_argv(tools, config, video_url, template, is_audio,
+                             extra=("--trim-filenames", str(MAX_NAME)))
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            ok = r.returncode == 0
+            code, files, tail = run_download(argv, lambda msg: None)
+            ok = code == 0
             if not ok:
-                dlog(f"playlist item failed: {video_url}: {r.stderr[-200:]}")
-        except Exception as e:
+                dlog(f"playlist item failed: {video_url}: {describe_failure(code, tail, argv)}")
+        except OSError as e:
             dlog(f"playlist item error: {video_url}: {e}")
-            ok = False
+            ok, files = False, []
         with lock:
+            produced.extend(files)
             if ok:
                 completed[0] += 1
             else:
                 failed[0] += 1
-            done = completed[0] + failed[0]
-            try:
-                send_progress({"type": "progress", "phase": "playlist_item", "current": done, "total": total})
-            except Exception:
-                pass
+            send_progress({"type": "progress", "phase": "playlist_item",
+                           "current": completed[0] + failed[0], "total": total})
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [pool.submit(dl, v) for v in items]
-        for f in as_completed(futures):
-            pass
+        list(pool.map(dl, items))
 
-    produced = [p for p in subfolder.iterdir() if p.is_file()]
     for p in produced:
         strip_quarantine(p)
-    tag_downloads(produced, config, ffmpeg, is_audio)
+    tag_downloads(produced, config, tools["ffmpeg"], is_audio)
 
     dest_label = display_path(subfolder)
     if failed[0] == 0:
@@ -1009,18 +903,21 @@ def download_playlist_parallel(url, name, is_audio, dest_dir, ffmpeg, yt_dlp,
 def write_token():
     """Write the auth token to TOKEN_PATH for external readers."""
     try:
-        with open(TOKEN_PATH, "w") as f:
-            f.write(AUTH_TOKEN)
-        os.chmod(TOKEN_PATH, 0o600)
+        TOKEN_PATH.write_text(AUTH_TOKEN, encoding="utf-8")
+        if sys.platform != "win32":
+            TOKEN_PATH.chmod(0o600)
         dlog(f"token written to {TOKEN_PATH}")
-    except Exception as exc:
+    except OSError as exc:
         dlog(f"failed to write token file: {exc}")
         sys.stderr.write(f"warning: could not write {TOKEN_PATH}: {exc}\n")
 
 
 def main():
+    DIRS.ensure()
     dlog(f"=== magpie_server.py {VERSION} starting ===")
     dlog(f"PATH={os.environ.get('PATH', '<unset>')}")
+    for old, new in magpie_paths.migrate(DIRS, dlog):
+        print(f"Moved {old} to {new}", flush=True)
 
     ensure_config_file()
     config = load_config()
@@ -1033,15 +930,17 @@ def main():
     dlog(f"config: {CONFIG_PATH}")
     dlog(f"audio -> {config['audio_dir']}")
     dlog(f"video -> {config['video_dir']}")
+    dlog(f"tools: {DIRS.bin} (missing: {magpie_tools.missing() or 'none'})")
     dlog(f"ibroadcast backup: {backup_state}")
     print(f"Config: {CONFIG_PATH}", flush=True)
     print(f"  audio_dir: {config['audio_dir']}", flush=True)
     print(f"  video_dir: {config['video_dir']}", flush=True)
     print(f"  ibroadcast backup: {backup_state}", flush=True)
+    print(f"Log: {LOG_PATH}", flush=True)
 
     write_token()
 
-    # Print token to stdout so the LaunchAgent can capture it
+    # Print token to stdout so whatever started the server can capture it
     print(f"MAGPIE_TOKEN={AUTH_TOKEN}", flush=True)
     dlog(f"auth token: {AUTH_TOKEN}")
 
@@ -1055,7 +954,7 @@ def main():
     if resumed:
         dlog(f"resuming {len(resumed)} job(s) left unfinished by the last run: {resumed}")
 
-    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), MagpieHandler)
+    server = MagpieHTTPServer((LISTEN_HOST, LISTEN_PORT), MagpieHandler)
     dlog(f"listening on http://{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"Magpie server {VERSION} listening on http://{LISTEN_HOST}:{LISTEN_PORT}", flush=True)
 

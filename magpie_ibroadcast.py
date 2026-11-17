@@ -13,6 +13,7 @@ https://github.com/iBroadcastMediaServices/ibroadcast-uploaders
 Standard library only, deliberately — `make install` should not require pip.
 """
 
+import base64
 import hashlib
 import json
 import mimetypes
@@ -24,6 +25,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+import magpie_paths
 
 OAUTH_DEVICE_URL = "https://oauth.ibroadcast.com/device/code"
 OAUTH_TOKEN_URL = "https://oauth.ibroadcast.com/token"
@@ -39,16 +42,13 @@ USER_AGENT = "Magpie stash uploader"
 UPLOAD_METHOD = "magpie"
 
 HOME = Path.home()
-TOKEN_PATH = Path(os.environ.get("MAGPIE_IBROADCAST_TOKEN")
-                  or HOME / ".config" / "magpie-ibroadcast.json")
+TOKEN_PATH = magpie_paths.DIRS.ibroadcast_token
 
 # Checksums this machine has uploaded. Needed because iBroadcast's own index
 # lags behind processing — see load_sent().
-SENT_PATH = Path(os.environ.get("MAGPIE_IBROADCAST_SENT")
-                 or HOME / ".config" / "magpie-ibroadcast-sent.json")
+SENT_PATH = magpie_paths.DIRS.ibroadcast_sent
 
-NAMES_PATH = Path(os.environ.get("MAGPIE_IBROADCAST_NAMES")
-                  or HOME / ".config" / "magpie-ibroadcast-names.json")
+NAMES_PATH = magpie_paths.DIRS.ibroadcast_names
 
 # iBroadcast is a music service; video stashes are never sent.
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".wma", ".aiff"}
@@ -177,12 +177,44 @@ def _multipart(fields, file_field, filename, payload):
 # Token storage
 # ---------------------------------------------------------------------------
 
+def _dpapi(data, protect):
+    """Encrypt (protect=True) or decrypt bytes with Windows DPAPI, which ties
+    them to this Windows user account. File permission bits do not protect a
+    file on Windows, so the token is stored encrypted instead."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buffer = ctypes.create_string_buffer(data, len(data))
+    blob_in = Blob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    blob_out = Blob()
+    crypt32 = ctypes.windll.crypt32
+    if protect:
+        ok = crypt32.CryptProtectData(ctypes.byref(blob_in), ctypes.c_wchar_p("Magpie iBroadcast token"),
+                                      None, None, None, 0, ctypes.byref(blob_out))
+    else:
+        ok = crypt32.CryptUnprotectData(ctypes.byref(blob_in), None, None, None, None, 0,
+                                        ctypes.byref(blob_out))
+    if not ok:
+        raise OSError(ctypes.GetLastError(), "DPAPI call failed")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+
 def load_token():
     """Return the stored token dict, or None if absent or unreadable."""
     try:
-        with open(TOKEN_PATH) as f:
+        with open(TOKEN_PATH, encoding="utf-8") as f:
             token = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        if sys.platform == "win32" and isinstance(token, dict) and "dpapi" in token:
+            token = json.loads(_dpapi(base64.b64decode(token["dpapi"]), protect=False))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
         return None
     if not isinstance(token, dict) or "access_token" not in token:
         return None
@@ -190,13 +222,17 @@ def load_token():
 
 
 def save_token(token):
-    """Persist the token dict with owner-only permissions."""
+    """Persist the token dict: owner-only permissions on macOS and Linux,
+    DPAPI-encrypted on Windows."""
     TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(token, indent=2)
+    if sys.platform == "win32":
+        text = json.dumps({"dpapi": base64.b64encode(_dpapi(text.encode("utf-8"), protect=True)).decode("ascii")})
     # Create with 0600 from the start rather than chmod-ing after writing, so
     # the secret is never briefly world-readable.
     fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(token, f, indent=2)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
         f.write("\n")
 
 

@@ -6,18 +6,23 @@ Two parts: a Tampermonkey userscript (the button) and a local Python server (cal
 
 ## Requirements
 
-- macOS
-- Python 3
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — `brew install yt-dlp`
-- [ffmpeg](https://ffmpeg.org/) — `brew install ffmpeg`
+- macOS (the server itself also runs on Windows and Linux)
+- Python 3.9 or later
 - [Tampermonkey](https://www.tampermonkey.net/) browser extension
+
+Magpie brings its own pinned copies of [yt-dlp](https://github.com/yt-dlp/yt-dlp),
+[ffmpeg/ffprobe](https://ffmpeg.org/) and [deno](https://deno.com) (the
+JavaScript runtime yt-dlp needs for YouTube). They download on first use, or
+with `make check`, each verified against its published SHA-256, into Magpie's
+own folder. Nothing on your PATH is used, so a Homebrew or system install
+never changes which version runs.
 
 ## Install
 
 ```bash
 # 1. Clone or copy to /Applications/Magpie (or anywhere you like)
 
-# 2. Check dependencies and install the LaunchAgent
+# 2. Install the bundled tools and the LaunchAgent
 make install
 
 # 3. Verify the server is running
@@ -43,10 +48,25 @@ check or force one from the Tampermonkey dashboard.
 
 Reload any YouTube video — the **Stash** button appears in the action bar.
 
+## Where Magpie keeps its files
+
+| | macOS | Windows | Linux |
+|---|---|---|---|
+| config, job database, iBroadcast login | `~/Library/Application Support/Magpie/` | `%LOCALAPPDATA%\Magpie\` | `~/.config/magpie/` (config), `~/.local/share/magpie/` (data) |
+| log (`magpie.log`) | `~/Library/Logs/Magpie/` | `%LOCALAPPDATA%\Magpie\Logs\` | `~/.local/state/magpie/log/` |
+| bundled tools | `~/Library/Application Support/Magpie/bin/` | `%LOCALAPPDATA%\Magpie\bin\` | `~/.local/share/magpie/bin/` |
+
+On Linux, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` move these as
+usual. On macOS, files from older versions in `~/.config` (`magpie.json`,
+`magpie-jobs.sqlite3`, `magpie-ibroadcast*.json`) move here on the first start;
+a file already in the new place is never overwritten.
+
 ## Download location
 
-Save folders live in `~/.config/magpie.json`. The server writes it with these
-defaults the first time it starts:
+Save folders live in `config.json` in the folder above. The server writes it
+with these defaults the first time it starts — your Music and Movies folders on
+macOS, Music and Videos elsewhere (Windows follows folder redirection, such as
+OneDrive; Linux follows `~/.config/user-dirs.dirs`):
 
 ```json
 {
@@ -101,8 +121,9 @@ make ibroadcast-login
 ```
 
 That prints a short code and a URL. Open the URL, enter the code, done. The
-token is saved to `~/.config/magpie-ibroadcast.json` with permissions `600`,
-outside this repo. It refreshes itself from then on.
+token is saved as `ibroadcast-token.json` in Magpie's data folder (see the
+table above): permissions `600` on macOS and Linux, encrypted for your
+Windows account on Windows. It refreshes itself from then on.
 
 Check it any time:
 
@@ -214,7 +235,7 @@ between MP3 and MP4 before retrying.
 A failed backup never means a failed stash — if the message starts with
 `Saved to`, your local file is already on disk.
 
-To turn it off, set this in `~/.config/magpie.json`:
+To turn it off, set this in `config.json`:
 
 ```json
 {
@@ -236,7 +257,7 @@ It's on by default. Until you've run `make ibroadcast-login`, each stash says
 ### Leaving the page
 
 A stash keeps going after you leave. Each one is a job the server saves
-before it starts (`~/.config/magpie-jobs.sqlite3`), so closing the tab, moving
+before it starts (`jobs.sqlite3` in Magpie's data folder), so closing the tab, moving
 to another video or even restarting the server doesn't stop it. Jobs left
 unfinished when the server stops pick up again when it starts.
 
@@ -255,7 +276,7 @@ make start       Start the server
 make stop        Stop the server
 make restart     Restart the server
 make status      Check if server is running
-make check       Verify dependencies
+make check       Install any missing bundled tool and check each one runs
 make logs        Tail the server log
 make test        Run the server tests (no network; never touches the live server)
 
@@ -271,4 +292,5 @@ make status      # check if server is responding
 make restart     # restart if stuck
 ```
 
-The server runs on `http://127.0.0.1:7865` and writes logs to `/tmp/magpie-server.log`.
+The server runs on `http://127.0.0.1:7865` and writes its log to `magpie.log`
+in the log folder above (`~/Library/Logs/Magpie/` on macOS).

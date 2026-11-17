@@ -1,0 +1,68 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: suite (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, python: "3.9" }
+          - { os: ubuntu-24.04, python: "3.12" }
+          - { os: ubuntu-24.04, python: "3.14" }
+          - { os: ubuntu-24.04-arm, python: "3.9" }
+          - { os: ubuntu-24.04-arm, python: "3.14" }
+          - { os: windows-latest, python: "3.9" }
+          - { os: windows-latest, python: "3.14" }
+          # setup-python has no 3.9 or 3.10 for Windows on Arm.
+          - { os: windows-11-arm, python: "3.11" }
+          - { os: windows-11-arm, python: "3.14" }
+          - { os: macos-latest, python: "3.9" }
+          - { os: macos-latest, python: "3.14" }
+          - { os: macos-15-intel, python: "3.14" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+
+  tools:
+    name: bundled tools (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
+    env:
+      MAGPIE_HOME: ${{ runner.temp }}/magpie
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install and check yt-dlp, ffmpeg, ffprobe and deno
+        run: python magpie_tools.py install
+      # YouTube blocks many cloud IP ranges, so a failure here says more about
+      # the runner's address than about Magpie. It runs to show what happens.
+      - name: Real download (informational)
+        continue-on-error: true
+        env:
+          MAGPIE_TEST_REAL: "1"
+          MAGPIE_TEST_BIN: ${{ runner.temp }}/magpie/bin
+        run: python -m unittest tests.test_jobs.RealDownloadTest -v

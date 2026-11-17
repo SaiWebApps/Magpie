@@ -18,9 +18,10 @@ After editing ANY file in this project, deploy the change. Never ask the user to
   - The stub's header must match `magpie.user.js`'s `@match`/`@grant`/`@connect`/`@run-at`:
     Tampermonkey ignores the header of a `@require`d file. Change one, change both.
   - Never claim the browser runs new code without evidence. After the user reloads,
-    the server log (`/tmp/magpie.log`) shows `GET /jobs?url=…` from the page.
+    the server log (`~/Library/Logs/Magpie/magpie.log`) shows `GET /jobs?url=…` from the page.
 
-- **Python changes (`magpie_server.py`, `magpie_ibroadcast.py`, `magpie_tags.py`):** Restart
+- **Python changes (`magpie_server.py`, `magpie_ibroadcast.py`, `magpie_tags.py`,
+  `magpie_jobs.py`, `magpie_paths.py`, `magpie_tools.py`):** Restart
   the server yourself:
   ```
   make -C /Applications/Magpie restart

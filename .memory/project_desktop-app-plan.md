@@ -25,3 +25,4 @@ Decisions on 2026-11-15 after the first phase 1 browser try:
 - **Backup off in config → ✅ with "iBroadcast backup is off"; on but login missing/expired → ⚠️ Not backed up.**
 - **Album renumbering is off** (the user sorts by title, so track numbers don't matter to them). New stashes carry no track number and no other file is rewritten. Turned off after measuring 6 s per stash into a 127-file album and ~30 stale copies in iBroadcast each time.
 - **Goal: the desktop app replaces the music skills** (/musicdiff, /musicsync, /musicdedupe). Sync should eventually run automatically in the app.
+- **Phase 2 testing (2026-11-15):** the user approved pushing a GitHub Actions workflow to SaiWebApps/Magpie for Windows/Linux/macOS tests. The user has no Windows PC, so Windows proof comes from CI only.

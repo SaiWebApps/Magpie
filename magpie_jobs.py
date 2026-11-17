@@ -12,7 +12,6 @@ did: every path ends with exactly one {"type": "done", ...} message.
 """
 
 import json
-import os
 import queue
 import secrets
 import sqlite3
@@ -22,8 +21,9 @@ import urllib.parse
 from pathlib import Path
 from threading import Condition, RLock, Thread
 
-DB_PATH = Path(os.environ.get("MAGPIE_JOBS_DB")
-               or Path.home() / ".config" / "magpie-jobs.sqlite3")
+import magpie_paths
+
+DB_PATH = magpie_paths.DIRS.jobs_db
 
 WORKERS = 3
 

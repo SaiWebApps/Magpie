@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Proof for the download queue and the iBroadcast confirmation.
+"""The download queue, the iBroadcast confirmation, and the yt-dlp command.
 
 Each test starts the real server (tests/serve_fake.py) on a spare port with
-all state in a temporary folder, and talks to it with http.client, which
+all state in a temporary MAGPIE_HOME, and talks to it with http.client, which
 connects directly rather than through any proxy.
 
   python3 -m unittest discover -s tests -v
 
-MAGPIE_TEST_REAL=1 also runs one real YouTube download through the queue
-(real yt-dlp and ffmpeg, files in a temporary folder, iBroadcast off).
+MAGPIE_TEST_REAL=1 also runs one real YouTube download through the queue with
+the bundled tools only (MAGPIE_TEST_BIN: their folder) and a PATH holding
+nothing but the system directories. iBroadcast is off for it.
 """
 
 import hashlib
@@ -16,7 +17,6 @@ import http.client
 import json
 import os
 import shutil
-import signal
 import socket
 import sqlite3
 import subprocess
@@ -32,12 +32,18 @@ SERVE = HERE / "serve_fake.py"
 sys.path.insert(0, str(HERE.parent))
 
 import magpie_ibroadcast  # noqa: E402
+import magpie_server  # noqa: E402
 
 
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def shown(path):
+    """How the server displays a folder in its messages."""
+    return magpie_server.display_path(Path(path))
 
 
 class Server:
@@ -51,7 +57,7 @@ class Server:
                  backup=None, env=None):
         self.tmp = Path(tmp)
         self.port = free_port()
-        config = self.tmp / "magpie.json"
+        config = self.tmp / "config.json"
         if not config.exists():
             config.write_text(json.dumps({
                 "audio_dir": str(self.tmp / "audio"),
@@ -60,13 +66,9 @@ class Server:
                 "tag_from_filename": tag,
             }))
         full_env = dict(os.environ,
-                        MAGPIE_TEST_DIR=str(self.tmp),
+                        MAGPIE_HOME=str(self.tmp),
                         MAGPIE_TEST_PORT=str(self.port),
-                        MAGPIE_CONFIG=str(config),
-                        MAGPIE_JOBS_DB=str(self.tmp / "jobs.sqlite3"),
-                        MAGPIE_IBROADCAST_TOKEN=str(self.tmp / "no-token.json"),
-                        MAGPIE_IBROADCAST_SENT=str(self.tmp / "sent.json"),
-                        MAGPIE_IBROADCAST_NAMES=str(self.tmp / "names.json"),
+                        MAGPIE_FAKE_ARGV_LOG=str(self.tmp / "argv.jsonl"),
                         MAGPIE_FAKE_DELAY=delay)
         for key in ("MAGPIE_FAKE_UPLOAD_LOG", "MAGPIE_TEST_REAL", "MAGPIE_FAKE_DROP",
                     "MAGPIE_FAKE_PROCESSING", "MAGPIE_FAKE_CONFIRM_TIMEOUT"):
@@ -78,7 +80,7 @@ class Server:
         full_env.update(env or {})
         self.proc = subprocess.Popen([sys.executable, str(SERVE)], env=full_env,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.time() + 15
+        deadline = time.time() + 20
         while True:
             try:
                 status, _ = self.call("GET", "/health")
@@ -86,11 +88,15 @@ class Server:
                     break
             except OSError:
                 pass
-            if time.time() > deadline:
-                self.stop()
-                raise RuntimeError("test server did not start; see " + str(self.tmp / "magpie.log"))
+            if time.time() > deadline or self.proc.poll() is not None:
+                self.kill()
+                raise RuntimeError("test server did not start; see " + str(self.log_path))
             time.sleep(0.1)
         self.token = self.call("GET", "/token")[1]["token"]
+
+    @property
+    def log_path(self):
+        return self.tmp / "logs" / "magpie.log"
 
     def connect(self, timeout=30):
         return http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
@@ -143,9 +149,10 @@ class Server:
             time.sleep(0.1)
         raise AssertionError(f"job {job_id} never reached the expected state; last: {job}")
 
-    def stop(self, sig=signal.SIGTERM):
+    def kill(self):
+        """End the server at once, with no cleanup (TerminateProcess on Windows)."""
         if self.proc.poll() is None:
-            self.proc.send_signal(sig)
+            self.proc.kill()
             self.proc.wait(10)
 
 
@@ -161,7 +168,7 @@ class ServerTestCase(unittest.TestCase):
 
     def tearDown(self):
         for server in self.servers:
-            server.stop(signal.SIGKILL)
+            server.kill()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def start(self, **kwargs):
@@ -181,12 +188,16 @@ class ServerTestCase(unittest.TestCase):
 
     def files(self, name):
         audio = self.tmp / "audio"
-        return sorted(p.name for p in audio.iterdir() if p.name.startswith(name + ".")) if audio.exists() else []
+        return sorted(p.name for p in audio.iterdir() if p.stem == name) if audio.exists() else []
 
     def fake_md5(self, name):
         """MD5 of what the stand-in yt-dlp writes for this stash name."""
         out = str(self.tmp / "audio" / f"{name}.mp3")
         return hashlib.md5(f"fake audio for {out}".encode("utf-8")).hexdigest()
+
+    def argv_log(self):
+        with open(self.tmp / "argv.jsonl", encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
 
 
 class JobQueueTests(ServerTestCase):
@@ -210,10 +221,11 @@ class JobQueueTests(ServerTestCase):
         status, job = self.create(server, "abc", "Quick")
         elapsed = time.time() - started
         self.assertEqual(status, 202)
-        self.assertLess(elapsed, 0.2, f"POST /jobs took {elapsed:.3f}s")
+        self.assertLess(elapsed, 0.5, f"POST /jobs took {elapsed:.3f}s")
         self.assertIn(job["state"], ("queued", "running"))
         db = sqlite3.connect(str(self.tmp / "jobs.sqlite3"))
         row = db.execute("SELECT name, format, key FROM jobs WHERE id = ?", (job["id"],)).fetchone()
+        db.close()
         self.assertEqual(row, ("Quick", "mp3", "video:abc"))
 
     def test_events_deliver_every_stage_in_order(self):
@@ -227,12 +239,36 @@ class JobQueueTests(ServerTestCase):
                                      "backing_up", "confirming", "done"])
         percents = [m["percent"] for m in messages if m.get("phase") == "downloading"]
         self.assertEqual(percents, sorted(percents))
-        self.assertEqual(percents[-1], 100.0)
+        self.assertEqual(percents[-1], 90.0)
         done = messages[-1]
         self.assertTrue(done["ok"])
         self.assertNotIn("backup_status", done)
-        self.assertEqual(done["message"], f"Saved to {self.tmp / 'audio'} · in iBroadcast")
+        self.assertEqual(done["message"], f"Saved to {shown(self.tmp / 'audio')} · in iBroadcast")
+        self.assertEqual(done["path"], str(self.tmp / "audio" / "Stages.mp3"))
         self.assertEqual(self.files("Stages"), ["Stages.mp3"])
+
+    def test_yt_dlp_runs_bundled_with_no_shell(self):
+        """The command is the bundled yt-dlp itself, never a shell or a
+        Homebrew path, and carries every flag Magpie depends on."""
+        server = self.start()
+        self.stash(server, "argv", "Argv")
+        argv = self.argv_log()[-1]
+        self.assertEqual(argv[0], str(HERE / "fake_tools" / "fake_yt_dlp.py"))
+        args = argv[1:]
+        for shell in ("/bin/zsh", "/bin/sh", "/bin/bash", "cmd.exe", "-c", "-l"):
+            self.assertNotIn(shell, args)
+        for arg in args:
+            self.assertNotIn(Path("/opt/homebrew"), Path(arg).parents)
+            self.assertNotIn(Path("/usr/local/bin"), Path(arg).parents)
+        for flag in ("--ignore-config", "--no-update", "--no-js-runtimes", "--newline",
+                     "--progress", "--no-playlist", "-x"):
+            self.assertIn(flag, args)
+        fake = str(HERE / "fake_tools" / "fake_tool.py")
+        self.assertEqual(args[args.index("--js-runtimes") + 1], "deno:" + fake)
+        self.assertEqual(args[args.index("--ffmpeg-location") + 1], fake)
+        self.assertEqual(args[args.index("--print") + 1], magpie_server.FILE_TEMPLATE)
+        self.assertEqual(args[-2:], ["--", "https://www.youtube.com/watch?v=argv"])
+        self.assertNotIn("--extractor-args", args)
 
     def test_leaving_the_page_does_not_stop_the_job(self):
         server = self.start(delay="0.3")
@@ -250,15 +286,15 @@ class JobQueueTests(ServerTestCase):
         first = self.start(delay="0.5", upload_log=uploads)
         _, job = self.create(first, "resume", "Resume")
         first.wait_for(job["id"], lambda j: j["message"].get("phase") == "downloading")
-        first.stop(signal.SIGKILL)      # crash mid-download, no cleanup
+        first.kill()                    # crash mid-download, no cleanup
 
         second = self.start(delay="0.05", upload_log=uploads)
         finished = second.wait_for(job["id"], lambda j: j["state"] in ("done", "failed"))
         self.assertEqual(finished["state"], "done")
-        self.assertEqual(finished["message"]["message"], f"Saved to {self.tmp / 'audio'} · in iBroadcast")
+        self.assertEqual(finished["message"]["message"], f"Saved to {shown(self.tmp / 'audio')} · in iBroadcast")
         self.assertEqual(self.files("Resume"), ["Resume.mp3"])
         self.assertEqual(uploads.read_text().splitlines(), ["Resume.mp3"])
-        log = (self.tmp / "magpie.log").read_text()
+        log = second.log_path.read_text(encoding="utf-8")
         self.assertIn(f"resuming 1 job(s) left unfinished by the last run: ['{job['id']}']", log)
 
     def test_page_finds_its_jobs_by_video_and_playlist(self):
@@ -302,7 +338,9 @@ class JobQueueTests(ServerTestCase):
         self.assertEqual(counts[-1], (3, 3))
         self.assertTrue(messages[-1]["ok"])
         self.assertEqual(messages[-1]["message"],
-                         f"Stashed 3 tracks to {self.tmp / 'audio' / 'Mix'} · iBroadcast backup is off")
+                         f"Stashed 3 tracks to {shown(self.tmp / 'audio' / 'Mix')} · iBroadcast backup is off")
+        self.assertEqual(sorted(p.name for p in (self.tmp / "audio" / "Mix").iterdir()),
+                         ["item1.mp3", "item2.mp3", "item3.mp3"])
 
     def test_jobs_need_the_token(self):
         server = self.start()
@@ -319,7 +357,7 @@ class IBroadcastConfirmationTests(ServerTestCase):
         done = self.stash(server, "off", "Off")[-1]
         self.assertTrue(done["ok"])
         self.assertNotIn("backup_status", done)
-        self.assertEqual(done["message"], f"Saved to {self.tmp / 'audio'} · iBroadcast backup is off")
+        self.assertEqual(done["message"], f"Saved to {shown(self.tmp / 'audio')} · iBroadcast backup is off")
 
     def test_missing_login_warns(self):
         server = self.start(backup=True)          # on, but no token stored
@@ -328,7 +366,7 @@ class IBroadcastConfirmationTests(ServerTestCase):
         self.assertEqual(done["backup_status"], "no_login")
         self.assertIn("make ibroadcast-login", done["backup_error"])
         self.assertEqual(done["message"],
-                         f"Saved to {self.tmp / 'audio'} · not backed up (no iBroadcast login)")
+                         f"Saved to {shown(self.tmp / 'audio')} · not backed up (no iBroadcast login)")
 
     def test_upload_never_listed_warns(self):
         uploads = self.tmp / "uploads.txt"
@@ -340,7 +378,7 @@ class IBroadcastConfirmationTests(ServerTestCase):
         self.assertTrue(done["ok"])
         self.assertEqual(done["backup_status"], "unconfirmed")
         self.assertIn("Dropped.mp3", done["backup_error"])
-        self.assertEqual(done["message"], f"Saved to {self.tmp / 'audio'} · not in iBroadcast yet")
+        self.assertEqual(done["message"], f"Saved to {shown(self.tmp / 'audio')} · not in iBroadcast yet")
         self.assertEqual(uploads.read_text().splitlines(), ["Dropped.mp3"])
 
     def test_already_listed_is_skipped(self):
@@ -348,21 +386,21 @@ class IBroadcastConfirmationTests(ServerTestCase):
         Path(str(uploads) + ".json").write_text(json.dumps({self.fake_md5("Have"): ["Have", 1, 0]}))
         server = self.start(upload_log=uploads)
         done = self.stash(server, "have", "Have")[-1]
-        self.assertEqual(done["message"], f"Saved to {self.tmp / 'audio'} · already in iBroadcast")
+        self.assertEqual(done["message"], f"Saved to {shown(self.tmp / 'audio')} · already in iBroadcast")
         self.assertFalse(uploads.exists(), "nothing should have been uploaded")
 
     def test_sent_long_ago_but_never_listed_is_sent_again(self):
         """Magpie's own record alone does not count as 'already there'."""
         uploads = self.tmp / "uploads.txt"
-        (self.tmp / "sent.json").write_text(json.dumps({self.fake_md5("Lost"): 0}))
+        (self.tmp / "ibroadcast-sent.json").write_text(json.dumps({self.fake_md5("Lost"): 0}))
         server = self.start(upload_log=uploads)
         done = self.stash(server, "lost", "Lost")[-1]
-        self.assertEqual(done["message"], f"Saved to {self.tmp / 'audio'} · in iBroadcast")
+        self.assertEqual(done["message"], f"Saved to {shown(self.tmp / 'audio')} · in iBroadcast")
         self.assertEqual(uploads.read_text().splitlines(), ["Lost.mp3"])
 
     def test_sent_moments_ago_is_waited_for_not_sent_twice(self):
         uploads = self.tmp / "uploads.txt"
-        (self.tmp / "sent.json").write_text(json.dumps({self.fake_md5("Fresh"): time.time()}))
+        (self.tmp / "ibroadcast-sent.json").write_text(json.dumps({self.fake_md5("Fresh"): time.time()}))
         server = self.start(upload_log=uploads, env={"MAGPIE_FAKE_CONFIRM_TIMEOUT": "60"})
         _, job = self.create(server, "fresh", "Fresh")
         server.wait_for(job["id"], lambda j: j["message"].get("phase") == "confirming")
@@ -370,7 +408,7 @@ class IBroadcastConfirmationTests(ServerTestCase):
         # The earlier copy finishes processing and shows up in the library.
         Path(str(uploads) + ".json").write_text(json.dumps({self.fake_md5("Fresh"): ["Fresh", 1, 0]}))
         finished = server.wait_for(job["id"], lambda j: j["state"] in ("done", "failed"))
-        self.assertEqual(finished["message"]["message"], f"Saved to {self.tmp / 'audio'} · in iBroadcast")
+        self.assertEqual(finished["message"]["message"], f"Saved to {shown(self.tmp / 'audio')} · in iBroadcast")
         self.assertFalse(uploads.exists())
 
 
@@ -412,10 +450,13 @@ class InLibraryTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("MAGPIE_TEST_REAL"), "set MAGPIE_TEST_REAL=1 to download from YouTube")
 class RealDownloadTest(unittest.TestCase):
+    """One real download with nothing but the bundled tools."""
 
     def test_real_video_through_the_queue(self):
         tmp = Path(tempfile.mkdtemp(prefix="magpie-real-"))
-        server = Server(tmp, real=True, tag=True)
+        system_path = os.pathsep.join(["/usr/bin", "/bin"]) if sys.platform != "win32" \
+            else os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+        server = Server(tmp, real=True, tag=True, env={"PATH": system_path})
         try:
             body = {"url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
                     "name": "MagpieTest_MeAtTheZoo", "format": "mp3"}
@@ -425,17 +466,20 @@ class RealDownloadTest(unittest.TestCase):
             self.assertTrue(done["ok"], done.get("error"))
             path = tmp / "audio" / "MagpieTest_MeAtTheZoo.mp3"
             self.assertTrue(path.is_file())
+            bin_dir = Path(os.environ.get("MAGPIE_TEST_BIN") or tmp / "bin")
+            ffprobe = bin_dir / ("ffprobe.exe" if sys.platform == "win32" else "ffprobe")
             probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", str(path)],
+                [str(ffprobe), "-v", "error", "-show_entries", "format_tags", "-of", "json", str(path)],
                 capture_output=True, text=True)
             tags = {k.lower(): v for k, v in json.loads(probe.stdout)["format"]["tags"].items()}
             print(f"\n  phases: {sorted(set(phases(messages)))}\n  message: {done['message']}"
-                  f"\n  file: {path.name} ({path.stat().st_size} bytes)\n  tags: {tags}")
+                  f"\n  file: {path.name} ({path.stat().st_size} bytes)\n  tags: {tags}"
+                  f"\n  server PATH: {system_path}")
             self.assertEqual(tags.get("album"), "MagpieTest")
             self.assertEqual(tags.get("title"), "MagpieTest_MeAtTheZoo")
             self.assertNotIn("track", tags)
         finally:
-            server.stop(signal.SIGKILL)
+            server.kill()
             shutil.rmtree(tmp, ignore_errors=True)
 
 

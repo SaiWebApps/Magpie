@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Magpie
 // @namespace    com.magpie.stash
-// @version      2.7.1
+// @version      2.8.0
 // @description  One-click YouTube audio/video stash via local server
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -241,6 +241,10 @@
     const phase = msg.phase;
     const pct = msg.percent;
     if (phase === 'queued') return '⌛ Queued…';
+    if (phase === 'installing') {
+      const count = msg.total > 1 ? ' ' + msg.current + '/' + msg.total : '';
+      return '⌛ Installing tools' + count + '…';
+    }
     if (phase === 'starting') return '⌛ Starting…';
     if (phase === 'loading') return '⌛ Loading…';
     if (phase === 'downloading' && typeof pct === 'number') {

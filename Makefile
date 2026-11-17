@@ -4,6 +4,7 @@ PLIST_NAME  := $(LABEL).plist
 PLIST_DIR   := $(HOME)/Library/LaunchAgents
 PLIST_DEST  := $(PLIST_DIR)/$(PLIST_NAME)
 LOG         := /tmp/magpie-server.log
+MAGPIE_LOG  := $(HOME)/Library/Logs/Magpie/magpie.log
 
 .PHONY: install uninstall reinstall start stop restart status check logs help \
         ibroadcast-login ibroadcast-status test
@@ -11,17 +12,9 @@ LOG         := /tmp/magpie-server.log
 help: ## Show available targets
 	@grep -E '^[a-z].*:.*##' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | column -t -s '	'
 
-check: ## Verify dependencies (python3, yt-dlp, ffmpeg)
-	@echo "Checking dependencies..."
-	@command -v python3  >/dev/null || { echo "  MISSING: python3";  exit 1; }
-	@command -v yt-dlp   >/dev/null || { echo "  MISSING: yt-dlp";   exit 1; }
-	@command -v ffmpeg   >/dev/null || { echo "  MISSING: ffmpeg";   exit 1; }
-	@command -v ffprobe  >/dev/null || { echo "  MISSING: ffprobe";  exit 1; }
-	@echo "  python3:  $$(command -v python3)"
-	@echo "  yt-dlp:   $$(command -v yt-dlp)"
-	@echo "  ffmpeg:   $$(command -v ffmpeg)"
-	@echo "  ffprobe:  $$(command -v ffprobe)"
-	@echo "All dependencies found."
+check: ## Install any missing bundled tool (yt-dlp, ffmpeg, ffprobe, deno) and check each runs
+	@command -v python3 >/dev/null || { echo "  MISSING: python3"; exit 1; }
+	@python3 "$(CURDIR)/magpie_tools.py" install
 
 install: check ## Install and start the LaunchAgent
 	@chmod +x "$(SERVER)"
@@ -53,7 +46,7 @@ install: check ## Install and start the LaunchAgent
 	@launchctl bootstrap gui/$$(id -u) "$(PLIST_DEST)"
 	@echo "Installed and started: $(PLIST_DEST)"
 	@echo "Server script: $(SERVER)"
-	@echo "Logs: $(LOG)"
+	@echo "Logs: $(MAGPIE_LOG)"
 
 uninstall: ## Stop server and remove LaunchAgent
 	@launchctl bootout gui/$$(id -u) "$(PLIST_DEST)" 2>/dev/null || true
@@ -81,7 +74,7 @@ status: ## Check if server is running
 	fi
 
 logs: ## Tail the server log
-	@tail -f "$(LOG)"
+	@tail -f "$(MAGPIE_LOG)"
 
 test: ## Run the server tests (no network; never touches the live server)
 	@python3 -m unittest discover -s "$(CURDIR)/tests" -v
