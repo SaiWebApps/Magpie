@@ -265,8 +265,9 @@ def request_device_code():
 def exchange_device_code(device_code):
     """Exchange a device code for a token.
 
-    Returns the token dict, or the string 'pending' while the user has not yet
-    approved in their browser."""
+    Returns the token dict, the string 'pending' while the user has not yet
+    approved in their browser, or 'expired' once the code can no longer be
+    used and a fresh one is needed."""
     body = _form({
         "client_id": CLIENT_ID,
         "grant_type": "device_code",
@@ -279,6 +280,10 @@ def exchange_device_code(device_code):
     if status >= 400:
         if obj.get("error") == "authorization_pending":
             return "pending"
+        # iBroadcast answers an expired code with invalid_grant ("device code
+        # has expired"); expired_token is the standard device-flow name.
+        if obj.get("error") in ("expired_token", "invalid_grant"):
+            return "expired"
         raise IBroadcastError(
             f"authorization failed: {obj.get('error_description') or obj}")
     return _stamp_expiry(obj)
@@ -621,6 +626,8 @@ def login_cli(total_seconds=900):
 
         while time.time() < code_dies_at and time.time() < give_up_at:
             result = exchange_device_code(device["device_code"])
+            if result == "expired":
+                break
             if result != "pending":
                 save_token(result)
                 print(f"\nAuthorized. Token saved to {TOKEN_PATH} (permissions 600).")

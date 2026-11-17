@@ -307,5 +307,30 @@ class TokenStorageTests(TempDirTestCase):
         self.assertEqual(magpie_ibroadcast.load_token(), {"access_token": "secret-access"})
 
 
+class DeviceLoginTests(unittest.TestCase):
+    """How the device-code login reads iBroadcast's answers, with no network."""
+
+    def setUp(self):
+        self.saved = magpie_ibroadcast._json_request
+
+    def tearDown(self):
+        magpie_ibroadcast._json_request = self.saved
+
+    def answer(self, status, obj):
+        magpie_ibroadcast._json_request = lambda *args, **kwargs: (status, obj)
+        return magpie_ibroadcast.exchange_device_code("code")
+
+    def test_waiting_and_expired_codes(self):
+        self.assertEqual(self.answer(400, {"error": "authorization_pending"}), "pending")
+        self.assertEqual(self.answer(400, {"error": "invalid_grant",
+                                           "error_description": "Invalid grant: device code has expired"}),
+                         "expired")
+        self.assertEqual(self.answer(400, {"error": "expired_token"}), "expired")
+
+    def test_refusal_raises(self):
+        with self.assertRaises(magpie_ibroadcast.IBroadcastError):
+            self.answer(400, {"error": "access_denied"})
+
+
 if __name__ == "__main__":
     unittest.main()

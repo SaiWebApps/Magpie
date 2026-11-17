@@ -6,3 +6,4 @@
 - [Desktop app plan](project_desktop-app-plan.md) — approved 2026-11-15: Tauri + Python sidecar, app replaces LaunchAgent, no Safari, magpie:// fallback
 - [No process residue](feedback_no-process-residue.md) — never write history of my behavior, mistakes, dates, or "used to/now" narration into code or docs
 - [Stop asking permission](feedback_stop-asking-permission.md) — take the actions a task needs (allowlist hosts, CI pushes, deploys) and report after; ask only for real product/design choices
+- [Isolate tests from real files](feedback_isolate-tests-from-real-files.md) — a test run once deleted the user's iBroadcast login; trace move sources too, back up before first run
