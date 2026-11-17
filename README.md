@@ -58,8 +58,9 @@ Reload any YouTube video — the **Stash** button appears in the action bar.
 
 On Linux, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` move these as
 usual. On macOS, files from older versions in `~/.config` (`magpie.json`,
-`magpie-jobs.sqlite3`, `magpie-ibroadcast*.json`) move here on the first start;
-a file already in the new place is never overwritten.
+`magpie-jobs.sqlite3`, `magpie-ibroadcast*.json`) move here on the first start.
+They are the files Magpie was using, so they win: a file already here from an
+older install is kept beside them as `<name>.before-move`.
 
 ## Download location
 

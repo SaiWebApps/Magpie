@@ -126,14 +126,25 @@ class MigrationTests(TempDirTestCase):
         self.assertEqual([p.name for p in old.iterdir()], [])
         self.assertEqual(magpie_paths.migrate(d), [])
 
-    def test_existing_new_file_is_never_overwritten(self):
-        old, _ = self.legacy()
+    def test_live_file_wins_and_the_older_one_is_kept(self):
+        old, files = self.legacy()
         d = magpie_paths.Dirs("darwin", {}, self.tmp)
         d.config_file.parent.mkdir(parents=True)
-        d.config_file.write_text('{"audio_dir": "/kept"}')
+        d.config_file.write_text('{"audio_dir": "/from-an-older-install"}')
         magpie_paths.migrate(d)
-        self.assertEqual(d.config_file.read_text(), '{"audio_dir": "/kept"}')
-        self.assertTrue((old / "magpie.json").exists())
+        self.assertEqual(d.config_file.read_text(), files["magpie.json"])
+        kept = d.config_file.with_name("config.json.before-move")
+        self.assertEqual(kept.read_text(), '{"audio_dir": "/from-an-older-install"}')
+        self.assertFalse((old / "magpie.json").exists())
+
+    def test_isolated_run_never_touches_the_real_files(self):
+        """A run with MAGPIE_HOME (every test server) must leave the files in
+        the home folder's ~/.config exactly where they are."""
+        old, files = self.legacy()
+        d = magpie_paths.Dirs("darwin", {"MAGPIE_HOME": str(self.tmp / "isolated")}, self.tmp)
+        self.assertEqual(magpie_paths.legacy_moves(d), [])
+        self.assertEqual(magpie_paths.migrate(d), [])
+        self.assertEqual(sorted(p.name for p in old.iterdir()), sorted(files))
 
     def test_other_platforms_move_nothing(self):
         self.legacy()

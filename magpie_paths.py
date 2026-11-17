@@ -83,6 +83,9 @@ class Dirs:
         env = os.environ if env is None else env
         home = Path(home) if home else Path.home()
         override = env.get("MAGPIE_HOME")
+        # An isolated run (MAGPIE_HOME) must never reach outside its folder,
+        # so it also never moves files from the user's real ~/.config.
+        self.isolated = bool(override)
         if override:
             root = Path(override)
             self.config = self.data = self.state = root
@@ -207,8 +210,9 @@ def user_dir(env, home, key):
 
 def legacy_moves(dirs):
     """(old path, new path) for each file the macOS-only Magpie kept in
-    ~/.config. Empty on other platforms: Magpie never ran there before."""
-    if dirs.platform != "darwin":
+    ~/.config. Empty on other platforms, where Magpie never ran before, and
+    for an isolated run (MAGPIE_HOME), which must leave the real files alone."""
+    if dirs.platform != "darwin" or dirs.isolated:
         return []
     old = dirs._home / ".config"
     return [
@@ -221,16 +225,22 @@ def legacy_moves(dirs):
 
 
 def migrate(dirs, log=lambda m: None):
-    """Move each legacy file to its new place, once.
+    """Move each file from ~/.config to its new place.
 
-    A file already at the new place wins and the old one is left alone, so
-    running this again, or after the user copied files by hand, never
-    overwrites anything. Returns the (old, new) pairs that were moved."""
+    The ~/.config file is the one the running Magpie uses, so it wins: a file
+    already at the new place (left by an older install) is kept beside it as
+    <name>.before-move rather than deleted. Once moved, the ~/.config file is
+    gone, so running this again changes nothing. Returns the (old, new) pairs
+    that were moved."""
     moved = []
     for old, new in legacy_moves(dirs):
-        if not old.is_file() or new.exists():
+        if not old.is_file():
             continue
         new.parent.mkdir(parents=True, exist_ok=True)
+        if new.exists():
+            kept = new.with_name(new.name + ".before-move")
+            os.replace(new, kept)
+            log(f"kept the existing {new} as {kept}")
         os.replace(old, new)
         moved.append((old, new))
         log(f"moved {old} -> {new}")
