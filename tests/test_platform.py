@@ -72,9 +72,9 @@ class DirsTests(TempDirTestCase):
         self.assertEqual(d.videos(), self.tmp / "Videos")
 
     def test_linux_xdg_variables_absolute_only(self):
-        env = {"XDG_CONFIG_HOME": str(self.tmp / "cfg"), "XDG_DATA_HOME": "relative/data"}
+        env = {"XDG_CONFIG_HOME": "/xdg/cfg", "XDG_DATA_HOME": "relative/data"}
         d = magpie_paths.Dirs("linux", env, self.tmp)
-        self.assertEqual(d.config, self.tmp / "cfg" / "magpie")
+        self.assertEqual(d.config, Path("/xdg/cfg") / "magpie")
         self.assertEqual(d.data, self.tmp / ".local" / "share" / "magpie")
 
     def test_linux_user_dirs_file(self):
