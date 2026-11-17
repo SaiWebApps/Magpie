@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-Skills built for Magpie (musicdiff, musicsync, musicdedupe, and any new ones) live in `/Applications/Magpie/.claude/skills/<name>/`. The user moved them there on 2026-11-10 after they were first created under `~/.claude-work/skills/` ("Why did you place these music skills in claude-work? Move them into this project." / "Move. Not copy").
+Skills built for Magpie (musicdiff, musicsync, musicdedupe, and any new ones) live in `/Applications/Magpie/.claude/skills/<name>/`. The user moved them there on 2026-11-10 after they were first created under `~/.claude-work/skills/`, and wanted them moved, not copied.
 
 **Why:** the user wants project tooling inside the project; user-level skills are for things they want in every project.
 

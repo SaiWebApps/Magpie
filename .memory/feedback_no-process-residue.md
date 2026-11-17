@@ -15,6 +15,6 @@ Banned, with real examples I wrote on 2026-11-15:
 
 Allowed: what the code does and why, stated in the present tense ("The library lists a new upload minutes before the checksum index does, so the index alone would keep the button waiting").
 
-**Why:** the user called it "a recurrent disease": "Never litter the code with artifacts that are useless to humans. Never litter the code with a history of your behavior, thinking, or mistakes." History belongs in git commits and memory, not in files.
+**Why:** the user considers this a recurring problem: anything in the code that is useless to humans, or that records my behavior, thinking or mistakes, is litter. History belongs in git commits and memory, not in files.
 
 **How to apply:** before every Edit/Write, reread new comments and docstrings and cut any dates, "used to", "now", "no longer", "once", "before", incident stories, or references to my own mistakes. Lessons about my own behavior go in memory files like this one, never in the repo. Related: [[project_desktop-app-plan]].

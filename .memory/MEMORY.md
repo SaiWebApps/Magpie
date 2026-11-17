@@ -7,3 +7,4 @@
 - [No process residue](feedback_no-process-residue.md) — never write history of my behavior, mistakes, dates, or "used to/now" narration into code or docs
 - [Stop asking permission](feedback_stop-asking-permission.md) — take the actions a task needs (allowlist hosts, CI pushes, deploys) and report after; ask only for real product/design choices
 - [Isolate tests from real files](feedback_isolate-tests-from-real-files.md) — a test run once deleted the user's iBroadcast login; trace move sources too, back up before first run
+- [Never shrink the allowlist](feedback_never-shrink-allowlist.md) — only add to dangerous_allowed_domains.csv, never remove entries; cleanup means temp files, not permissions
