@@ -391,8 +391,12 @@ def get_tools(send_progress):
 
 
 def popen_kwargs():
-    """Text pipes in UTF-8 on every OS, and no console window on Windows."""
-    kwargs = {"encoding": "utf-8", "errors": "replace"}
+    """Text pipes in UTF-8 on every OS, and no console window on Windows.
+
+    yt-dlp otherwise writes in the console code page on Windows, which mangles
+    any character outside it in titles and error messages."""
+    kwargs = {"encoding": "utf-8", "errors": "replace",
+              "env": dict(os.environ, PYTHONIOENCODING="utf-8")}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     return kwargs
@@ -400,8 +404,9 @@ def popen_kwargs():
 
 def yt_dlp_base(tools, config):
     """The arguments every yt-dlp call shares: no config file or self-update
-    can change behaviour, and the bundled deno and ffmpeg are the ones used."""
-    return [*tools["yt-dlp"], "--ignore-config", "--no-update",
+    can change behaviour, output is UTF-8, and the bundled deno and ffmpeg are
+    the ones used."""
+    return [*tools["yt-dlp"], "--ignore-config", "--no-update", "--encoding", "utf-8",
             "--no-js-runtimes", "--js-runtimes", f"deno:{tools['deno']}",
             "--ffmpeg-location", tools["ffmpeg"],
             *player_client_args(config["youtube_player_client"])]

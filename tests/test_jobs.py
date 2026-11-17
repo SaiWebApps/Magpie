@@ -266,6 +266,7 @@ class JobQueueTests(ServerTestCase):
         fake = str(HERE / "fake_tools" / "fake_tool.py")
         self.assertEqual(args[args.index("--js-runtimes") + 1], "deno:" + fake)
         self.assertEqual(args[args.index("--ffmpeg-location") + 1], fake)
+        self.assertEqual(args[args.index("--encoding") + 1], "utf-8")
         self.assertEqual(args[args.index("--print") + 1], magpie_server.FILE_TEMPLATE)
         self.assertEqual(args[-2:], ["--", "https://www.youtube.com/watch?v=argv"])
         self.assertNotIn("--extractor-args", args)
