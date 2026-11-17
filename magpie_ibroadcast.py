@@ -62,8 +62,8 @@ UPLOAD_TIMEOUT = 600
 
 # After an upload, how long to wait for the track to appear in the library
 # before reporting it missing, and how often to look. iBroadcast accepts a
-# file before processing it, and sometimes never lists it at all; one measured
-# upload took about 100 seconds to appear.
+# file before processing it, and sometimes never lists it at all; a new upload
+# can take a minute or more to appear.
 CONFIRM_TIMEOUT = 15 * 60
 CONFIRM_INTERVAL = 2
 
@@ -372,7 +372,7 @@ def load_sent():
     iBroadcast accepts an upload before it finishes processing it, so a file
     sent a minute ago can still be absent from the library. Such a file must
     be waited for, not sent again; the time says whether it is that recent.
-    A plain list without times (the earlier format) loads with time 0."""
+    A plain list of MD5s without times also loads, each with time 0."""
     try:
         with open(SENT_PATH) as f:
             data = json.load(f)

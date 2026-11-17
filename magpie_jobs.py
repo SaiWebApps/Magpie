@@ -7,8 +7,8 @@ still unfinished when the server stops are picked up again on the next start.
 Closing the page that started a stash therefore never stops or loses it.
 
 The work itself is not in this module. The server hands JobRunner a function
-run(job, send_progress) that follows the same contract the old /stash handler
-did: every path ends with exactly one {"type": "done", ...} message.
+run(job, send_progress) whose every path ends with exactly one
+{"type": "done", ...} message.
 """
 
 import json

@@ -152,8 +152,8 @@
   // ---- Error tooltip --------------------------------------------------------
   //
   // A native title= tooltip waits about a second before appearing and is easy
-  // to miss, which made the error look like it was never there. This one shows
-  // on the first hover with no delay.
+  // to miss, so an error can look as if it was never shown. This one shows on
+  // the first hover with no delay.
 
   const TIP_ID = 'magpie-error-tip';
 

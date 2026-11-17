@@ -147,8 +147,8 @@ What it does and doesn't do:
 - **A failed upload never fails a stash.** The local file is already saved by
   then. The button says so, and the reason is one hover away.
 - **✅ means iBroadcast lists the track.** iBroadcast accepts an upload before
-  it processes it — a track took about 100 seconds to appear in a measured
-  run. Magpie waits until your library shows it, checking every 2 seconds,
+  it processes it, and a new track can take a minute or more to appear.
+  Magpie waits until your library shows it, checking every 2 seconds,
   and gives up after 15 minutes with a warning instead of a ✅.
 
 The Stash button shows `Backing up…` during the upload and `Waiting for
@@ -252,7 +252,7 @@ It's on by default. Until you've run `make ibroadcast-login`, each stash says
 1. Go to any YouTube video
 2. Click **Stash** in the action bar
 3. Edit the filename if you want, hit OK
-4. Progress shows on the button (%, Converting, Finishing)
+4. Progress shows on the button (Queued, Converting, Backing up, Waiting for iBroadcast)
 5. Path appears below the video when done — click to copy
 
 ### Leaving the page
@@ -262,7 +262,7 @@ before it starts (`jobs.sqlite3` in Magpie's data folder), so closing the tab, m
 to another video or even restarting the server doesn't stop it. Jobs left
 unfinished when the server stops pick up again when it starts.
 
-Come back to the video and the button shows where the job is — `⌛ 64%`,
+Come back to the video and the button shows where the job is — `⌛ Converting…`,
 `✅ Stashed` with the saved path, or the failure with its reason on hover.
 Finished jobs are shown this way for 24 hours. The server runs up to three
 jobs at once; any more wait their turn as `⌛ Queued…`.

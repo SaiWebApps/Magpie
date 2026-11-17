@@ -468,7 +468,7 @@ def describe_failure(code, tail, argv):
 
 
 # ---------------------------------------------------------------------------
-# SSE helpers
+# NDJSON helpers
 # ---------------------------------------------------------------------------
 
 def ndjson_line(data_dict):
@@ -484,9 +484,9 @@ class MagpieHandler(BaseHTTPRequestHandler):
     """Handles /health, /token, /jobs, /stash and /check-dupe."""
 
     server_version = f"Magpie/{VERSION}"
-    # HTTP/1.1 so /stash can stream with chunked transfer encoding (the browser
-    # hands each chunk to GM_xmlhttpRequest's onprogress as it arrives). All
-    # non-stream responses send Content-Length, so keep-alive stays well-framed.
+    # HTTP/1.1 so /stash and /jobs/<id>/events can stream with chunked transfer
+    # encoding. All non-stream responses send Content-Length, so keep-alive
+    # stays well-framed.
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):

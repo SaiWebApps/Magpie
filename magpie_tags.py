@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Derive audio tags from Magpie's filename convention.
 
-Files are named {Album}_{Track}.mp3, split on the FIRST underscore:
+Files are named {Album}_{Track}.mp3. The album is the token before the FIRST
+underscore; the title is the whole filename:
 
-    AC_Mirage_Escape.mp3      -> album "AC",     title "Mirage_Escape"
-    WetLeg_NotFun.mp3         -> album "WetLeg", title "NotFun"
+    AC_Mirage_Escape.mp3      -> album "AC",     title "AC_Mirage_Escape"
+    WetLeg_NotFun.mp3         -> album "WetLeg", title "WetLeg_NotFun"
     Espresso.mp3              -> no album,       title "Espresso"
 
 Album aliases fold related prefixes into one album — every Assassin's Creed
-numbering lands under "AC". Override album_aliases in ~/.config/magpie.json to
+numbering lands under "AC". Override album_aliases in Magpie's config.json to
 add more.
 
-Without this, a downloaded file carries no tags at all and iBroadcast falls
-back to the filename, which is how the library ended up full of "Unknown
-Album" and titles like "Music/AC3_AgainstAllOdds.mp3".
+Without this, a downloaded file carries no tags at all, and iBroadcast files
+it under "Unknown Album" with the filename as its title.
 """
 
 import shutil
@@ -49,7 +49,8 @@ def parse_name(stem, aliases=None):
 
 
 def _run(args, timeout=300):
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=timeout)
 
 
 def apply_tags(path, ffmpeg, aliases=None, log=lambda m: None, track=None):
