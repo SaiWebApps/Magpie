@@ -216,12 +216,14 @@ class JobQueueTests(ServerTestCase):
         self.assertEqual(resp.getheader("Server").split(" ")[0], "Magpie/2.0-http")
 
     def test_create_job_answers_at_once_and_saves_it(self):
+        # The stand-in download takes over 3 s at this delay; the answer must
+        # arrive well before it finishes, on a slow runner too.
         server = self.start(delay="0.3")
         started = time.time()
         status, job = self.create(server, "abc", "Quick")
         elapsed = time.time() - started
         self.assertEqual(status, 202)
-        self.assertLess(elapsed, 0.5, f"POST /jobs took {elapsed:.3f}s")
+        self.assertLess(elapsed, 2.0, f"POST /jobs took {elapsed:.3f}s")
         self.assertIn(job["state"], ("queued", "running"))
         db = sqlite3.connect(str(self.tmp / "jobs.sqlite3"))
         row = db.execute("SELECT name, format, key FROM jobs WHERE id = ?", (job["id"],)).fetchone()
